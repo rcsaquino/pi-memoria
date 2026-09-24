@@ -92,8 +92,8 @@ export function debounce<A extends unknown[]>(fn: (...args: A) => void, waitMs: 
 export async function atomicWriteFile(path: string, data: string | Uint8Array): Promise<void> {
 	await mkdir(dirname(path), { recursive: true });
 	const tmp = `${path}.${process.pid}.${randomBytes(4).toString("hex")}.tmp`;
-	await (typeof data === "string" ? writeFile(tmp, data, "utf8") : writeFile(tmp, data));
 	try {
+		await (typeof data === "string" ? writeFile(tmp, data, "utf8") : writeFile(tmp, data));
 		await rename(tmp, path);
 	} catch (error) {
 		await rm(tmp, { force: true }).catch(() => {});
@@ -132,7 +132,10 @@ export async function moveToTrash(path: string, trashDir: string): Promise<strin
 	await mkdir(trashDir, { recursive: true });
 	const base = path.split("/").pop() ?? "memory.md";
 	const stamp = new Date().toISOString().replace(/[:.]/g, "-");
-	const target = join(trashDir, `${stamp}__${base}`);
+	// Different categories can contain the same basename and be removed within
+	// one millisecond. A random suffix prevents rename() from replacing the
+	// earlier trashed file on POSIX filesystems.
+	const target = join(trashDir, `${stamp}_${randomBytes(8).toString("hex")}__${base}`);
 	await rename(path, target);
 	return target;
 }

@@ -174,6 +174,37 @@ test("memoria_write then memoria_recall round-trips through tools", async () => 
 	});
 });
 
+test("concurrent first tool calls share one initialized runtime", async () => {
+	await withHarness(async (harness) => {
+		const write = harness.tools.get("memoria_write")!;
+		const [first, second] = await Promise.all([
+			write.execute("cold-1", { topic: "Shared topic", category: "projects", content: "The alpha fact survives." }, undefined, undefined, harness.ctx),
+			write.execute("cold-2", { topic: "Shared topic", category: "projects", content: "The beta fact survives." }, undefined, undefined, harness.ctx),
+		]);
+		const read = harness.tools.get("memoria_read")!;
+		const result = await read.execute("cold-read", { ref: first.details.id }, undefined, undefined, harness.ctx);
+		const body = String(result.content[0].text);
+		assert.equal(first.details.id, second.details.id);
+		assert.match(body, /alpha fact survives/);
+		assert.match(body, /beta fact survives/);
+	});
+});
+
+test("memoria_move requires an explicit merge for an occupied topic", async () => {
+	await withHarness(async (harness) => {
+		const write = harness.tools.get("memoria_write")!;
+		const source = await write.execute("move-source", { topic: "Alice work", category: "people", content: "Alice knows Rust." }, undefined, undefined, harness.ctx);
+		const target = await write.execute("move-target", { topic: "Alice", category: "people", content: "Alice knows Go." }, undefined, undefined, harness.ctx);
+		const move = harness.tools.get("memoria_move")!;
+		await assert.rejects(() => move.execute("move-refuse", { from: source.details.id, topic: "Alice" }, undefined, undefined, harness.ctx), /merge: true/);
+		const merged = await move.execute("move-combine", { from: source.details.id, topic: "Alice", merge: true }, undefined, undefined, harness.ctx);
+		assert.equal(merged.details.id, target.details.id);
+		const read = harness.tools.get("memoria_read")!;
+		const former = await read.execute("move-read", { ref: source.details.id }, undefined, undefined, harness.ctx);
+		assert.match(String(former.content[0].text), /Alice knows Rust/);
+	});
+});
+
 test("before_agent_start injects the system section and an auto-recall message", async () => {
 	await withHarness(async (harness) => {
 		await harness.emit("session_start", { type: "session_start", reason: "startup" }, harness.ctx);

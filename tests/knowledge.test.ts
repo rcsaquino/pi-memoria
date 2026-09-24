@@ -59,6 +59,24 @@ test("usage store ignores corrupt files and prunes missing notes", async () => {
 	}
 });
 
+test("a failed usage flush stays dirty and can be retried", async () => {
+	const root = await tempRoot();
+	try {
+		const blocked = join(root, "blocked");
+		await writeFile(blocked, "not a directory");
+		const store = new UsageStore(blocked);
+		store.record("mem_retry", "hit");
+		await assert.rejects(() => store.save());
+		assert.equal(store.dirty, true);
+		await rm(blocked);
+		await mkdir(blocked);
+		await store.save();
+		assert.equal((await UsageStore.load(blocked)).get("mem_retry")?.hits, 1);
+	} finally {
+		await rm(root, { recursive: true, force: true });
+	}
+});
+
 test("usage store finds stale and promotion candidates", () => {
 	const store = new UsageStore("/tmp/unused");
 	const now = Date.now();

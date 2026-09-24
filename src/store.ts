@@ -5,8 +5,7 @@
  * pure and testable.
  */
 
-import { existsSync } from "node:fs";
-import { mkdir, readdir, readFile, rm, stat } from "node:fs/promises";
+import { mkdir, readdir, readFile, realpath, rm, stat } from "node:fs/promises";
 import { basename, join, relative, resolve } from "node:path";
 import { parseDateValue, splitFrontmatter, stringifyWithFrontmatter } from "./frontmatter.ts";
 import { accumulateTokens, stem, tokenize, tokenizeRaw } from "./tokenize.ts";
@@ -1090,8 +1089,8 @@ export interface MoveMemoryInput {
 	/** Target category folder. Defaults to the note's current category. */
 	category?: string;
 	/**
-	 * When the target topic already exists: true (default) merges this note into
-	 * it, false refuses and reports the conflict.
+	 * When the target topic already exists: true explicitly merges this note into
+	 * it; omitted or false refuses and reports the conflict.
 	 */
 	merge?: boolean;
 	/** Record the note's previous names as aliases of the target (default true). */
@@ -1147,17 +1146,33 @@ export async function moveMemory(
 	}
 
 	const target = await readMemoryDoc(root, targetPath);
-	if (target && input.merge === false) {
+	if (target && input.merge !== true) {
 		throw new Error(
 			`${targetRelPath} already exists (topic "${target.topic}"), so moving ${doc.relPath} there would either overwrite or mix two subjects. Re-run with merge: true to combine them, or pick a different topic.`,
 		);
 	}
 	const previousAliases = target ? normalizeAliases([...target.aliases, ...parseStringList(target.frontmatter.aliases)]) : [];
+	const historicalIds = normalizeAliases([...(target ? [doc.id] : []), ...previousAliases, ...doc.aliases].filter((alias) => alias.startsWith("mem_")));
+	if (target && historicalIds.length >= MAX_ALIASES) {
+		throw new Error(`Cannot merge ${doc.relPath}: the target has reached the ${MAX_ALIASES}-alias limit for historical ids.`);
+	}
 	const aliases = normalizeAliases([
+		...historicalIds,
+		...(target ? [doc.id] : []),
 		...previousAliases,
 		...doc.aliases,
 		...(keepAlias ? [doc.topic, doc.title, basename(doc.relPath).replace(/\.md$/i, "")] : []),
 	]);
+	const requiredAliases = [
+		...(target ? [doc.id] : []), ...previousAliases, ...doc.aliases,
+		...(keepAlias ? [doc.topic, doc.title, basename(doc.relPath).replace(/\.md$/i, "")] : []),
+	];
+	if (requiredAliases.some((alias) => {
+		const normalized = normalizeAliases([alias])[0];
+		return normalized && !aliases.some((saved) => saved.toLowerCase() === normalized.toLowerCase());
+	})) {
+		throw new Error(`Cannot move ${doc.relPath}: keeping its former names would exceed the ${MAX_ALIASES}-alias limit.`);
+	}
 	const aliasesAdded = aliases.filter((alias) => !previousAliases.some((previous) => previous.toLowerCase() === alias.toLowerCase()));
 
 	if (target) {
@@ -1173,14 +1188,28 @@ export async function moveMemory(
 		}
 		const tags = [...new Set([...target.tags, ...doc.tags])];
 		const priority = priorityRank(doc.priority) > priorityRank(target.priority) ? doc.priority : target.priority;
+		const related = normalizeLinks([...target.related, ...doc.related]);
+		const supersedes = normalizeLinks([...target.supersedes, ...doc.supersedes]);
+		const linksFit = (required: string[], saved: string[]): boolean => required.every((link) => {
+			const normalized = normalizeLinks([link])[0];
+			return !normalized || saved.some((entry) => entry.toLowerCase() === normalized.toLowerCase());
+		});
+		if (!linksFit([...target.related, ...doc.related], related) || !linksFit([...target.supersedes, ...doc.supersedes], supersedes)) {
+			throw new Error(`Cannot merge ${doc.relPath}: keeping its links would exceed the ${MAX_LINKS}-link limit.`);
+		}
+		// The journal must exist before the target changes. Recovery only removes
+		// the source after it verifies that the target contains all its facts and
+		// its former id; an interrupted target write therefore cannot lose data.
+		await writeJournal(root, { op: "move", from: doc.relPath, to: target.relPath, merge: true, at: Date.now() });
 		const updated = await updateMemory(root, target, {
 			content: body,
 			tags,
 			aliases,
+			related,
+			supersedes,
 			summary: extendSummary(target.summary, doc.summary),
 			priority,
 		});
-		await writeJournal(root, { op: "move", from: doc.relPath, to: updated.relPath, at: Date.now() });
 		const trashPath = await deleteMemory(root, doc);
 		await clearJournal(root).catch(() => {});
 		return { ...base, doc: updated, moved: true, merged: mergedFacts > 0, aliasesAdded, trashPath };
@@ -1238,6 +1267,8 @@ export function countFacts(body: string): number {
 
 export interface MoveJournalEntry {
 	op: "move";
+	/** A merge keeps the target id and must be verified before source removal. */
+	merge?: boolean;
 	/** Relative path of the source file. */
 	from: string;
 	/** Relative path of the destination file. */
@@ -1259,7 +1290,10 @@ export async function readJournal(root: string): Promise<MoveJournalEntry | unde
 	if (!raw) return undefined;
 	try {
 		const parsed = JSON.parse(raw) as MoveJournalEntry;
-		if (parsed && parsed.op === "move" && typeof parsed.from === "string" && typeof parsed.to === "string") return parsed;
+		const safe = (path: string): boolean => isIndexableRelPath(path)
+			&& !path.split("/").some((part) => part === "." || part === ".." || !part);
+		if (parsed && parsed.op === "move" && typeof parsed.from === "string" && typeof parsed.to === "string"
+			&& safe(parsed.from) && safe(parsed.to)) return parsed;
 	} catch {
 		// A corrupt journal is not worth failing over; the files themselves are
 		// authoritative and doctor reports duplicate ids.
@@ -1278,16 +1312,22 @@ export async function clearJournal(root: string): Promise<void> {
 export async function recoverJournal(root: string): Promise<string | undefined> {
 	const entry = await readJournal(root);
 	if (!entry) return undefined;
-	const fromPath = join(root, entry.from);
-	const toPath = join(root, entry.to);
+	const fromPath = await safeMemoryPath(root, entry.from);
+	const toPath = await safeMemoryPath(root, entry.to);
 	let recovered: string | undefined;
-	if (existsSync(fromPath) && existsSync(toPath)) {
+	if (fromPath && toPath) {
+		const [source, target] = await Promise.all([readMemoryDoc(root, fromPath), readMemoryDoc(root, toPath)]);
+		const complete = source && target && (entry.merge
+			? target.aliases.includes(source.id) && extractFactUnits(source.body).every((unit) => !appendFact(target.body, unit.label, unit.text).changed)
+			: source.id === target.id);
+		if (!complete) return `interrupted move kept source ${entry.from}: target is incomplete`;
 		await moveToTrash(fromPath, join(root, TRASH_DIR, "moved")).then(
 			() => {
 				recovered = `completed interrupted move ${entry.from} -> ${entry.to}`;
 			},
 			() => undefined,
 		);
+		if (!recovered) return undefined;
 	}
 	await clearJournal(root).catch(() => {});
 	return recovered;
@@ -1614,8 +1654,8 @@ export async function resolveMemoryRef(
 	const trimmed = ref.trim();
 	if (!trimmed) return undefined;
 	if (trimmed.endsWith(".md")) {
-		const candidate = trimmed.startsWith("/") ? trimmed : resolve(root, trimmed);
-		const direct = await readMemoryDoc(root, candidate);
+		const candidate = await safeMemoryPath(root, trimmed);
+		const direct = candidate ? await readMemoryDoc(root, candidate) : undefined;
 		if (direct) return direct;
 	}
 	const needle = trimmed.toLowerCase();
@@ -1631,11 +1671,24 @@ export async function resolveMemoryRef(
 	return undefined;
 }
 
-/** Read a range of lines from a file path inside the store, guarding traversal. */
+/** Resolve only note files inside this store, including through symlinks. */
+async function safeMemoryPath(root: string, ref: string): Promise<string | undefined> {
+	const target = resolve(root, ref);
+	if (!isIndexableRelPath(normalizePath(relative(root, target)))) return undefined;
+	try {
+		const [realRoot, realTarget] = await Promise.all([realpath(root), realpath(target)]);
+		if (!isIndexableRelPath(normalizePath(relative(realRoot, realTarget)))) return undefined;
+		return target;
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+		throw error;
+	}
+}
+
+/** Read a memory file inside this store, guarding traversal and symlinks. */
 export async function readStoreFile(root: string, relOrAbs: string, maxChars = 40_000): Promise<{ path: string; content: string; truncated: boolean }> {
-	const target = relOrAbs.startsWith("/") ? relOrAbs : resolve(root, relOrAbs);
-	const normalizedRoot = resolve(root);
-	if (!normalizePath(target).startsWith(normalizePath(normalizedRoot))) {
+	const target = await safeMemoryPath(root, relOrAbs);
+	if (!target) {
 		throw new Error(`Refusing to read outside the memoria root: ${relOrAbs}`);
 	}
 	const content = await readFile(target, "utf8");

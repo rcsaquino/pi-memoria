@@ -29,14 +29,14 @@ import { RECALL_CUSTOM_TYPE, buildRecallParts, renderRecallBlock, renderStatusLi
 import { buildTranscriptText, harvestSession } from "./src/learn.ts";
 import { createModelReranker } from "./src/rerank.ts";
 import { tokenizeRaw } from "./src/tokenize.ts";
-import { oneLine } from "./src/util.ts";
+import { KeyedMutex, oneLine } from "./src/util.ts";
 
 const RECENT_PROMPT_LIMIT = 6;
 
 export default function memoria(pi: ExtensionAPI) {
 	let runtime: MemoriaRuntime | undefined;
 	let runtimeCwd: string | undefined;
-	let initPromise: Promise<void> | undefined;
+	const runtimeLock = new KeyedMutex();
 	let hotCache: { content: string; chars: number; limit: number; over: boolean; mtimeMs: number } | undefined;
 	let recentPrompts: string[] = [];
 	/** The missing-ripgrep warning is shown once per session, not on every prompt. */
@@ -47,27 +47,31 @@ export default function memoria(pi: ExtensionAPI) {
 	let learnInFlight = false;
 
 	/** Resolve (and lazily initialize) the runtime for this working directory. */
-	const getRuntime = async (ctx: ExtensionContext): Promise<MemoriaRuntime> => {
+	const getRuntime = (ctx: ExtensionContext): Promise<MemoriaRuntime> => runtimeLock.run("runtime", async () => {
 		if (!runtime || runtimeCwd !== ctx.cwd) {
-			await runtime?.dispose().catch(() => {});
+			const previous = runtime;
+			runtime = undefined;
+			runtimeCwd = undefined;
+			await previous?.dispose().catch(() => {});
 			// Follow pi's own agent directory (honours PI_CODING_AGENT_DIR) so the
 			// store lives at `<agent dir>/memoria`.
-			runtime = new MemoriaRuntime(ctx.cwd, { agentDir: getAgentDir() });
+			const next = new MemoriaRuntime(ctx.cwd, { agentDir: getAgentDir() });
+			try {
+				await next.init(true);
+			} catch (error) {
+				await next.dispose().catch(() => {});
+				throw error;
+			}
+			runtime = next;
 			runtimeCwd = ctx.cwd;
 			hotCache = undefined;
 			recentPrompts = [];
 			turnsSinceLearn = 0;
 			lastLearnAt = 0;
 			learnInFlight = false;
-			initPromise = runtime.init(true).catch((error) => {
-				// Allow a later attempt to retry instead of caching the rejection forever.
-				initPromise = undefined;
-				throw error;
-			});
 		}
-		await initPromise;
 		return runtime;
-	};
+	});
 
 	/** Read MEMORY.md, reusing the cached copy until its mtime changes. */
 	const readHotCached = async (memoria: MemoriaRuntime): Promise<{ content: string; chars: number; limit: number; over: boolean }> => {
@@ -237,13 +241,14 @@ export default function memoria(pi: ExtensionAPI) {
 		} catch {
 			// Shutdown must never throw.
 		}
-		await runtime?.flushUsageNow().catch(() => {});
-		await runtime?.dispose().catch(() => {});
-		runtime = undefined;
-		runtimeCwd = undefined;
-		initPromise = undefined;
-		hotCache = undefined;
-		recentPrompts = [];
+		await runtimeLock.run("runtime", async () => {
+			await runtime?.flushUsageNow().catch(() => {});
+			await runtime?.dispose().catch(() => {});
+			runtime = undefined;
+			runtimeCwd = undefined;
+			hotCache = undefined;
+			recentPrompts = [];
+		});
 	});
 
 	pi.registerMessageRenderer(RECALL_CUSTOM_TYPE, (message, options, theme) => {

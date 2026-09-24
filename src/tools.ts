@@ -138,7 +138,7 @@ const MoveParams = Type.Object({
 	category: Type.Optional(Type.String({ description: "Target category folder. Defaults to the note's current category." })),
 	merge: Type.Optional(
 		Type.Boolean({
-			description: "When a note already exists at the target topic: true (default) folds this note's facts into it, false refuses so you can choose another topic.",
+			description: "When a note already exists at the target topic: set true to fold this note's facts into it. Omitted or false refuses the merge.",
 		}),
 	),
 	keep_alias: Type.Optional(Type.Boolean({ description: "Record the note's previous topic and file name as aliases of the target (default true)." })),

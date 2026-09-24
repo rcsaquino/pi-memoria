@@ -7,6 +7,7 @@ import { join } from "node:path";
 import { MemoriaRuntime } from "../src/runtime.ts";
 import { renderRecallBlock, renderSystemSection, buildRecallQuery } from "../src/recall.ts";
 import { MemoryIndex } from "../src/index-engine.ts";
+import { createMemory } from "../src/store.ts";
 
 /**
  * Hermetic runtime: the store lives under a temporary home directory, never in
@@ -41,6 +42,24 @@ test("init creates the store inside the pi agent directory, not the project", as
 		assert.equal(result.hits.length, 0);
 		assert.ok(result.tookMs < 250);
 	});
+});
+
+test("concurrent lazy index callers wait for the same completed load", async () => {
+	const cwd = await mkdtemp(join(tmpdir(), "memoria-lazy-cwd-"));
+	const home = await mkdtemp(join(tmpdir(), "memoria-lazy-home-"));
+	const runtime = new MemoriaRuntime(cwd, { home, agentDir: join(home, ".pi", "agent") });
+	try {
+		await runtime.prepare();
+		await createMemory(runtime.roots.primary, { topic: "Cold load", category: "projects", content: "The cold index has this fact." });
+		const [first, second] = await Promise.all([runtime.indexFor(runtime.roots.primary), runtime.indexFor(runtime.roots.primary)]);
+		assert.equal(first, second);
+		assert.equal(first.aliveCount, 1);
+		assert.equal(second.aliveCount, 1);
+	} finally {
+		await runtime.dispose();
+		await rm(cwd, { recursive: true, force: true });
+		await rm(home, { recursive: true, force: true });
+	}
 });
 
 test("write then search finds the new memory without a rescan", async () => {
@@ -450,6 +469,37 @@ test("move keeps exactly one index entry per note and search stays consistent", 
 	});
 });
 
+test("a merged note remains editable through the source's former id", async () => {
+	await withRuntime(async (runtime) => {
+		const source = await runtime.write({ topic: "Alice work", category: "people", content: "Alice knows Rust.", related: ["legacy_dependency"], supersedes: ["legacy_old"] });
+		const target = await runtime.write({ topic: "Alice", category: "people", content: "Alice knows Go.", related: ["current_dependency"] });
+		const moved = await runtime.move(source.result.doc.id, { topic: "Alice", merge: true });
+		assert.equal(moved?.result.doc.id, target.result.doc.id);
+		assert.deepEqual(moved?.result.doc.related, ["current_dependency", "legacy_dependency"]);
+		assert.deepEqual(moved?.result.doc.supersedes, ["legacy_old"]);
+		assert.equal((await runtime.readMemory(source.result.doc.id))?.doc.id, target.result.doc.id);
+		const updated = await runtime.updateMemoryById(source.result.doc.id, { content: "# Alice\n\nAlice knows Rust and Go." });
+		assert.equal(updated?.doc.id, target.result.doc.id);
+		assert.equal((await runtime.search("rust go")).hits[0]?.doc.id, target.result.doc.id);
+		await runtime.dispose();
+		await runtime.init(true);
+		assert.equal((await runtime.readMemory(source.result.doc.id))?.doc.id, target.result.doc.id, "the former id survives an index reload");
+	});
+});
+
+test("a merged imported note keeps a nonstandard former id", async () => {
+	await withRuntime(async (runtime) => {
+		await runtime.importJsonl(JSON.stringify({
+			type: "memory", id: "legacy_alice_7", relPath: "library/people/alice-work.md",
+			title: "Alice work", category: "people", body: "# Alice work\n\nAlice knows Rust.",
+		}));
+		const target = await runtime.write({ topic: "Alice", category: "people", content: "Alice knows Go." });
+		await runtime.move("legacy_alice_7", { topic: "Alice", merge: true });
+		assert.equal((await runtime.readMemory("legacy_alice_7"))?.doc.id, target.result.doc.id);
+		assert.equal((await runtime.updateMemoryById("legacy_alice_7", { content: "# Alice\n\nAlice knows Go and Rust." }))?.doc.id, target.result.doc.id);
+	});
+});
+
 test("doctor flags relation-shaped file names and clashing aliases", async () => {
 	await withRuntime(async (runtime) => {
 		await mkdir(join(runtime.roots.primary, "library", "people"), { recursive: true });
@@ -515,6 +565,50 @@ test("the search cache returns cached results and is dropped on the next write",
 		const third = await runtime.search("pgvector");
 		assert.notEqual(third.cached, true, "a write invalidates the cache");
 		assert.equal(third.hits.length, 2);
+	});
+});
+
+test("cached searches observe external edits and imported notes", async () => {
+	await withRuntime(async (runtime) => {
+		const written = await runtime.write({ topic: "Orchid", category: "projects", content: "Orchid uses SQLite." });
+		assert.equal((await runtime.search("redis")).hits.length, 0);
+		assert.equal((await runtime.search("redis")).cached, true);
+		const index = await runtime.indexFor(runtime.roots.primary);
+		const path = join(runtime.roots.primary, written.result.doc.relPath);
+		await writeFile(path, (await readFile(path, "utf8")).replace("SQLite", "Redis clusters"), "utf8");
+		index.dirty = true;
+		const edited = await runtime.search("redis");
+		assert.notEqual(edited.cached, true);
+		assert.equal(edited.hits[0]?.doc.id, written.result.doc.id);
+		assert.equal((await runtime.search("redis")).cached, true);
+		await writeFile(path, (await readFile(path, "utf8")).replace("Redis clusters", "Memcached nodes"), "utf8");
+		index.dirty = true;
+		await runtime.overview();
+		const afterOverview = await runtime.search("redis");
+		assert.notEqual(afterOverview.cached, true);
+		assert.equal(afterOverview.hits.length, 0, "an overview refresh invalidates prior results");
+
+		assert.equal((await runtime.search("quartz")).hits.length, 0);
+		assert.equal((await runtime.search("quartz")).cached, true);
+		await runtime.importJsonl(JSON.stringify({
+			type: "memory", id: "mem_import_cache", relPath: "library/projects/quartz.md",
+			title: "Quartz", category: "projects", body: "# Quartz\n\nQuartz uses columnar storage.",
+		}));
+		const imported = await runtime.search("quartz");
+		assert.notEqual(imported.cached, true);
+		assert.equal(imported.hits[0]?.doc.id, "mem_import_cache");
+	});
+});
+
+test("cached searches distinguish weighted prompt history", async () => {
+	await withRuntime(async (runtime) => {
+		const oats = await runtime.write({ topic: "Oat preferences", category: "preferences", content: "Oat milk is preferred." });
+		const pears = await runtime.write({ topic: "Pear preferences", category: "preferences", content: "Pear juice is preferred." });
+		const first = await runtime.search("preferred drink", { parts: [{ text: "oat", weight: 1 }] });
+		const second = await runtime.search("preferred drink", { parts: [{ text: "pear", weight: 1 }] });
+		assert.equal(first.hits[0]?.doc.id, oats.result.doc.id);
+		assert.equal(second.hits[0]?.doc.id, pears.result.doc.id);
+		assert.notEqual(second.cached, true);
 	});
 });
 

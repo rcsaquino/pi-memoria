@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -20,6 +20,8 @@ import {
 	parseMemoryDoc,
 	readHot,
 	readMemoryDoc,
+	readStoreFile,
+	recoverJournal,
 	resolveMemoryRef,
 	removeHotMatches,
 	renderLibraryIndexes,
@@ -201,6 +203,21 @@ test("deleteMemory moves files to .trash", async () => {
 		const trashPath = await deleteMemory(root, doc);
 		assert.equal(existsSync(doc.path), false);
 		assert.equal(existsSync(trashPath), true);
+	} finally {
+		await rm(root, { recursive: true, force: true });
+	}
+});
+
+test("soft deletes with the same basename keep both trashed copies", async () => {
+	const root = await tempRoot();
+	try {
+		await ensureStore(root, 5000);
+		const first = await createMemory(root, { topic: "Release notes", category: "alpha", content: "Alpha released." });
+		const second = await createMemory(root, { topic: "Release notes", category: "beta", content: "Beta released." });
+		const [firstTrash, secondTrash] = await Promise.all([deleteMemory(root, first.doc), deleteMemory(root, second.doc)]);
+		assert.notEqual(firstTrash, secondTrash);
+		assert.match(await readFile(firstTrash, "utf8"), /Alpha released/);
+		assert.match(await readFile(secondTrash, "utf8"), /Beta released/);
 	} finally {
 		await rm(root, { recursive: true, force: true });
 	}
@@ -572,6 +589,53 @@ test("moveMemory re-files a relation note under the real name", async () => {
 	}
 });
 
+test("memory path reads stay inside the library, including through symlinks", async () => {
+	const root = await tempRoot();
+	const outside = await tempRoot();
+	try {
+		await ensureStore(root, 5000);
+		const external = join(outside, "private.md");
+		await writeFile(external, "# Private\n\nOutside the store.", "utf8");
+		assert.equal(await resolveMemoryRef(root, external), undefined);
+		await assert.rejects(() => readStoreFile(root, external), /Refusing to read/);
+		const link = join(root, "library", "inbox", "linked.md");
+		await symlink(external, link);
+		assert.equal(await resolveMemoryRef(root, "library/inbox/linked.md"), undefined);
+		await assert.rejects(() => readStoreFile(root, "library/inbox/linked.md"), /Refusing to read/);
+	} finally {
+		await rm(root, { recursive: true, force: true });
+		await rm(outside, { recursive: true, force: true });
+	}
+});
+
+test("journal recovery preserves a merge source until every fact reaches the target", async () => {
+	const root = await tempRoot();
+	try {
+		await ensureStore(root, 5000);
+		const source = await createMemory(root, { topic: "Alice work", category: "people", content: "Alice knows Rust." });
+		const target = await createMemory(root, { topic: "Alice", category: "people", content: "Alice knows Go." });
+		const journal = join(root, ".index", "journal.json");
+		await writeFile(journal, JSON.stringify({ op: "move", from: source.relPath, to: target.relPath, merge: true, at: Date.now() }));
+		assert.match(await recoverJournal(root) ?? "", /kept source/);
+		assert.ok(existsSync(source.path));
+		assert.ok(existsSync(journal));
+		const moved = await moveMemory(root, source.doc, { topic: "Alice", merge: true });
+		assert.equal(moved.doc.aliases.includes(source.doc.id), true);
+		assert.ok(!existsSync(source.path));
+		const another = await createMemory(root, { topic: "Alice hobbies", category: "people", content: "Alice plays chess." });
+		await writeFile(journal, JSON.stringify({ op: "move", from: another.relPath, to: moved.doc.relPath, merge: true, at: Date.now() }));
+		await updateMemory(root, moved.doc, {
+			content: appendFact(moved.doc.body, undefined, "Alice plays chess.").body,
+			aliases: [...moved.doc.aliases, another.doc.id],
+		});
+		assert.match(await recoverJournal(root) ?? "", /completed interrupted move/);
+		assert.ok(!existsSync(another.path));
+		assert.ok(!existsSync(journal));
+	} finally {
+		await rm(root, { recursive: true, force: true });
+	}
+});
+
 test("moveMemory merges into an existing note rather than clobbering it", async () => {
 	const root = await tempRoot();
 	try {
@@ -588,7 +652,7 @@ test("moveMemory merges into an existing note rather than clobbering it", async 
 		const legacy = await readMemoryDoc(root, legacyPath);
 		assert.ok(legacy);
 
-		const moved = await moveMemory(root, legacy, { topic: "Bob" });
+		const moved = await moveMemory(root, legacy, { topic: "Bob", merge: true });
 		assert.equal(moved.merged, true);
 		assert.equal(moved.doc.id, target.doc.id, "the target note keeps its identity");
 		assert.equal(moved.doc.relPath, target.doc.relPath);
@@ -597,7 +661,8 @@ test("moveMemory merges into an existing note rather than clobbering it", async 
 		assert.equal((moved.doc.body.match(/## Facts/g) ?? []).length, 1, "one Facts section");
 		assert.deepEqual(moved.doc.tags, ["family"]);
 		assert.equal(moved.doc.priority, "high");
-		assert.deepEqual(moved.doc.aliases, ["John's father", "johns-father"]);
+		assert.deepEqual(moved.doc.aliases, [legacy.id, "John's father", "johns-father"]);
+		assert.equal((await resolveMemoryRef(root, legacy.id))?.id, target.doc.id, "the retired id still resolves");
 		assert.ok(!existsSync(legacyPath));
 	} finally {
 		await rm(root, { recursive: true, force: true });
@@ -613,9 +678,38 @@ test("moveMemory refuses to touch an existing note unless merge is allowed", asy
 		const legacy = await readMemoryDoc(root, legacyPath);
 		assert.ok(legacy);
 		await assert.rejects(() => moveMemory(root, legacy, { topic: "Bob", merge: false }), /already exists/);
+		await assert.rejects(() => moveMemory(root, legacy, { topic: "Bob" }), /already exists/);
 		assert.ok(existsSync(legacyPath), "nothing was moved");
 		const stillThere = await readMemoryDoc(root, legacyPath);
 		assert.equal(stillThere?.topic, "John's father");
+	} finally {
+		await rm(root, { recursive: true, force: true });
+	}
+});
+
+test("merge refuses to discard old aliases when the alias limit is full", async () => {
+	const root = await tempRoot();
+	try {
+		await ensureStore(root, 5000);
+		const target = await createMemory(root, { topic: "Alice", category: "people", content: "Alice knows Go.", aliases: Array.from({ length: 24 }, (_, i) => `alice-name-${i}`) });
+		const source = await createMemory(root, { topic: "Alice work", category: "people", content: "Alice knows Rust." });
+		await assert.rejects(() => moveMemory(root, source.doc, { topic: "Alice", merge: true }), /alias limit/);
+		assert.ok(existsSync(source.path));
+		assert.equal((await readMemoryDoc(root, target.path))?.aliases.length, 24);
+	} finally {
+		await rm(root, { recursive: true, force: true });
+	}
+});
+
+test("merge refuses to discard links when the link limit is full", async () => {
+	const root = await tempRoot();
+	try {
+		await ensureStore(root, 5000);
+		const target = await createMemory(root, { topic: "Alice", category: "people", content: "Alice knows Go.", related: Array.from({ length: 16 }, (_, i) => `mem_link_${i}`) });
+		const source = await createMemory(root, { topic: "Alice work", category: "people", content: "Alice knows Rust.", related: ["mem_extra_link"] });
+		await assert.rejects(() => moveMemory(root, source.doc, { topic: "Alice", merge: true }), /link limit/);
+		assert.ok(existsSync(source.path));
+		assert.equal((await readMemoryDoc(root, target.path))?.related.length, 16);
 	} finally {
 		await rm(root, { recursive: true, force: true });
 	}

@@ -150,6 +150,8 @@ export class MemoryIndex {
 
 	private termIds = new Map<string, number>();
 	private idToIdx = new Map<string, number>();
+	/** Built only for lookups that miss canonical ids; aliases are not the hot path. */
+	private aliasToIdx: Map<string, number> | undefined;
 	private relPathToIdx = new Map<string, number>();
 	private bodyCache: BodyCache;
 	private trigramIndex: Map<string, number[]> | undefined;
@@ -237,7 +239,20 @@ export class MemoryIndex {
 	}
 
 	idxForId(id: string): number | undefined {
-		return this.idToIdx.get(id);
+		const direct = this.idToIdx.get(id);
+		if (direct !== undefined) return direct;
+		// Imports may have ids that do not use the mem_ prefix. A merge records the
+		// retired id as an alias, so every former id must remain usable.
+		if (!this.aliasToIdx) {
+			this.aliasToIdx = new Map();
+			for (let idx = 0; idx < this.docs.length; idx += 1) {
+				if (!this.alive[idx]) continue;
+				for (const alias of this.docs[idx].aliases) {
+					if (!this.aliasToIdx.has(alias)) this.aliasToIdx.set(alias, idx);
+				}
+			}
+		}
+		return this.aliasToIdx.get(id);
 	}
 
 	idxForRelPath(relPath: string): number {
@@ -323,6 +338,7 @@ export class MemoryIndex {
 		this.docTfs.push(tfs);
 		this.alive.push(true);
 		this.idToIdx.set(doc.id, idx);
+		this.aliasToIdx = undefined;
 		this.relPathToIdx.set(meta.relPath, idx);
 		this.bodyCache.set(doc.path, doc.body);
 		this.linkCache = undefined;
@@ -335,6 +351,7 @@ export class MemoryIndex {
 		const doc = this.docs[idx];
 		this.alive[idx] = false;
 		this.idToIdx.delete(doc.id);
+		this.aliasToIdx = undefined;
 		this.relPathToIdx.delete(doc.relPath);
 		this.bodyCache.delete(doc.path);
 		const termIds = this.docTerms[idx] ?? [];
@@ -414,6 +431,7 @@ export class MemoryIndex {
 		this.docTfs = newDocTfs;
 		this.alive = new Array(newDocs.length).fill(true);
 		this.idToIdx = new Map();
+		this.aliasToIdx = undefined;
 		this.relPathToIdx = new Map();
 		for (let i = 0; i < newDocs.length; i += 1) {
 			this.idToIdx.set(newDocs[i].id, i);
@@ -437,6 +455,7 @@ export class MemoryIndex {
 		this.alive = [];
 		this.termIds = new Map();
 		this.idToIdx = new Map();
+		this.aliasToIdx = undefined;
 		this.relPathToIdx = new Map();
 		this.trigramIndex = undefined;
 		this.fuzzyCache.clear();
@@ -505,10 +524,8 @@ export class MemoryIndex {
 		const resolve = (ref: string): number | undefined => {
 			const trimmed = ref.trim();
 			if (!trimmed) return undefined;
-			if (trimmed.startsWith("mem_")) {
-				const idx = this.idToIdx.get(trimmed);
-				if (idx !== undefined) return idx;
-			}
+			const byId = this.idxForId(trimmed);
+			if (byId !== undefined) return byId;
 			const byPath = this.relPathToIdx.get(normalizeRelPath(trimmed));
 			if (byPath !== undefined) return byPath;
 			return titles.get(trimmed.toLowerCase());
@@ -542,7 +559,7 @@ export class MemoryIndex {
 		const titles = this.links().titles;
 		const trimmed = ref.trim();
 		if (!trimmed) return undefined;
-		const byId = this.idToIdx.get(trimmed);
+		const byId = this.idxForId(trimmed);
 		if (byId !== undefined && this.alive[byId]) return byId;
 		const byPath = this.relPathToIdx.get(normalizeRelPath(trimmed));
 		if (byPath !== undefined && this.alive[byPath]) return byPath;
@@ -827,6 +844,7 @@ export class MemoryIndex {
 		}
 		this.alive = new Array(docCount).fill(true);
 		this.idToIdx = new Map();
+		this.aliasToIdx = undefined;
 		this.relPathToIdx = new Map();
 		for (let i = 0; i < docCount; i += 1) {
 			this.idToIdx.set(this.docs[i].id, i);
@@ -935,6 +953,14 @@ export class MemoryIndex {
 	async search(query: string, options: SearchOptions = {}): Promise<SearchResult> {
 		const started = performance.now();
 		await this.refresh(false);
+		const result = this.searchWarm(query, options);
+		this.lastSearchMs = Math.round((performance.now() - started) * 100) / 100;
+		return result;
+	}
+
+	/** Score an index the caller has already refreshed. */
+	searchWarm(query: string, options: SearchOptions = {}): SearchResult {
+		const started = performance.now();
 		const result = searchIndex(this, query, options);
 		this.lastSearchMs = Math.round((performance.now() - started) * 100) / 100;
 		return result;

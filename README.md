@@ -17,8 +17,8 @@ a millisecond.
 - **Broad topics, never fact files.** `likes-apples.md` is a defect; facts
   accumulate in `food-preferences.md`.
 - **Names are handles.** Aliases make every nickname, full name or former name
-  resolve to the same note, and notes can be re-filed later without breaking
-  references.
+  resolve to the same note. Re-filing or consolidating notes also keeps retired
+  note ids usable as references.
 - **Zero runtime dependencies.** No database, no server, no embedding service, no
   build step. Retrieval is a BM25 index kept in memory.
 
@@ -83,11 +83,11 @@ Pi discovers `extensions/memoria/index.ts` on the next start (or after
 ### Install as a pi package
 
 ```bash
-pi install git:github.com/rcsaquino/pi-memoria@v0.1.1
+pi install git:github.com/rcsaquino/pi-memoria@v0.1.3
 pi install npm:pi-memoria                 # if published to npm
 pi install ./path/to/pi-memoria           # or from a local checkout
 pi list
-pi remove git:github.com/rcsaquino/pi-memoria@v0.1.1
+pi remove git:github.com/rcsaquino/pi-memoria@v0.1.3
 ```
 
 `pi install` records the package in `~/.pi/agent/settings.json` (or
@@ -233,9 +233,10 @@ When the better name *is* known, `memoria_move` re-files the note:
 
 - Target free → the file is **renamed**; the note keeps its `id`, so ids read
   earlier in the session stay valid.
-- Target exists → facts are **merged** in (duplicates skipped, nothing
-  overwritten) and the old file goes to `.trash/`. `merge: false` reports the
-  conflict instead.
+- Target exists → the move reports a conflict. Set `merge: true` to combine the
+  facts and links (duplicates skipped, nothing overwritten) and move the old
+  file to `.trash/`. A merge refuses to discard aliases or links when their
+  limits are full.
 - The previous topic, title and file name are added to the target's aliases, so
   old references keep working.
 
@@ -308,7 +309,7 @@ folder). Unknown keys are preserved verbatim through updates.
 | `memoria_recall` | Search long-term memory. Filters by category, tags, priority, recency, scope; options for `include_body`, `min_score`, `explain`, `rerank`, `drop_superseded`, prefix/fuzzy control. |
 | `memoria_write` | Add a fact to a broad **topic note** (`topic`, `content`, optional `label`, category, tags, aliases, related, supersedes, summary, priority). Creates the note on first use and appends afterwards. |
 | `memoria_read` | Read a full note by id, path or alias, with its aliases, related notes and superseding notes. |
-| `memoria_move` | Re-file a note under a better broad topic (`from`, `topic`, optional `category`, `merge`, `keep_alias`). Renames when the target is free, merges when it is not. |
+| `memoria_move` | Re-file a note under a better broad topic (`from`, `topic`, optional `category`, `merge`, `keep_alias`). Renames when the target is free; set `merge: true` to combine with an occupied target. |
 | `memoria_sessions` | Search the transcripts of earlier conversations (`action: "search"`, plus `since_days`, `project`, `include_tools`, `user_only`) and read the surrounding dialogue (`action: "read"`, `path`, `line`, `window`) before quoting it. |
 | `memoria_hot` | Read/add/remove/replace/compact `MEMORY.md`, the always-in-context briefing. |
 | `memoria_list` | Browse categories, titles, ids, tags, aliases and summaries. |
@@ -326,7 +327,7 @@ have to ask.
 /memoria search <query>      Ranked results with snippets (--primary/--project/--all)
 /memoria store <text>        Quick capture into library/inbox
 /memoria read <id|path>      Print a full note
-/memoria move <ref> <topic>  Re-file a note under a better broad topic
+/memoria move <ref> <topic> [--merge]  Re-file a note; opt into merging an occupied target
 /memoria hot                 Show MEMORY.md
 /memoria topics              Review notes: facts, size, usage, merge candidates
 /memoria diff [days]         Memories created or updated recently (default 7 days)
@@ -571,10 +572,13 @@ a burst of edits costs one refresh.
 - **Files, not a database.** Memoria never owns your data: notes are markdown
   with frontmatter, deletes are soft (moved to `.trash/`), and the index is
   derived and can be rebuilt with `/memoria reindex`.
-- **Crash-safe moves.** Category moves and renames are journaled, so an
-  interrupted move is completed on the next start instead of leaving two copies.
+- **Crash-safe moves.** Category moves, renames and merges are journaled. On
+  restart, a merge only removes its source after the target has all its facts
+  and the source's former id.
 - **Atomic writes.** Every write goes through a temp file and rename; there is no
   window where a note is half-written.
+- **Scoped reads.** `memoria_read` only follows paths inside the memory library;
+  transcript window reads refuse paths or symlinks outside configured roots.
 - **Secrets:** memoria does not scan for credentials, and the learn prompt tells
   the model not to store them. If you keep secrets in the store anyway, remember
   that recall may surface them in model context — treat the store like your shell
@@ -600,7 +604,7 @@ a burst of edits costs one refresh.
 
 ```bash
 npm install            # dev-only: pi host packages + typescript
-npm test               # 144 tests, node:test, no build step
+npm test               # node:test, no build step
 npm run typecheck      # tsc --noEmit
 npm run eval           # recall@1/@5/MRR over the fixture corpus
 npm run bench          # latency at 1k and 5k notes
@@ -647,8 +651,8 @@ src/commands.ts     /memoria subcommands
    `"optional": true` in `peerDependenciesMeta`, keeping them in
    `devDependencies` for local tests only. Without that, npm installs a ~450 MB
    duplicate of pi into the package.
-4. Tag releases (`git tag v0.1.1 && git push --tags`) and install by tag:
-   `pi install git:github.com/<you>/pi-memoria@v0.1.1`.
+4. Tag releases (`git tag v<version> && git push --tags`) and install by tag:
+   `pi install git:github.com/<you>/pi-memoria@v<version>`.
 5. `npm pack --dry-run` should list only `index.ts`, `src/**`, `skills/**`,
    `README.md`, `LICENSE` and `package.json`.
 

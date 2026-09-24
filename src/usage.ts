@@ -34,6 +34,7 @@ function coerceEntry(raw: unknown): UsageEntry | undefined {
 export class UsageStore {
 	private docs = new Map<string, UsageEntry>();
 	private changed = false;
+	private saving?: Promise<void>;
 	private lastSessionAt = 0;
 
 	constructor(root: string) {
@@ -137,10 +138,23 @@ export class UsageStore {
 	}
 
 	async save(): Promise<void> {
+		if (this.saving) {
+			await this.saving;
+			return this.save();
+		}
 		if (!this.changed) return;
 		this.changed = false;
 		const payload: UsageFile = { version: USAGE_VERSION, docs: Object.fromEntries(this.docs), lastSessionAt: this.lastSessionAt };
-		await atomicWriteFile(join(this.root, INDEX_DIR, USAGE_FILE), JSON.stringify(payload));
+		const saving = atomicWriteFile(join(this.root, INDEX_DIR, USAGE_FILE), JSON.stringify(payload));
+		this.saving = saving;
+		try {
+			await saving;
+		} catch (error) {
+			this.changed = true;
+			throw error;
+		} finally {
+			if (this.saving === saving) this.saving = undefined;
+		}
 	}
 
 	/** Notes with no recorded use in `staleMs`, oldest first. */

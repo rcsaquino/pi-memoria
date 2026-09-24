@@ -26,7 +26,7 @@ const SUBCOMMANDS: Array<{ value: string; label: string; description: string }> 
 	{ value: "search", label: "search <query>", description: "Search long-term memory" },
 	{ value: "store", label: "store <text>", description: "Quickly save a memory to the inbox" },
 	{ value: "read", label: "read <id|path>", description: "Read a full memory note" },
-	{ value: "move", label: "move <ref> <topic>", description: "Re-file a note under a better broad topic" },
+	{ value: "move", label: "move <ref> <topic> [--merge]", description: "Re-file a note under a better broad topic" },
 	{ value: "hot", label: "hot", description: "Show MEMORY.md and its budget" },
 	{ value: "reindex", label: "reindex", description: "Rebuild the search index from disk" },
 	{ value: "index", label: "index", description: "Regenerate library/INDEX.md table of contents" },
@@ -183,12 +183,13 @@ export function registerMemoriaCommand(pi: ExtensionAPI, getRuntime: RuntimeGett
 				}
 				case "move": {
 					const [ref, ...rest] = remainder.split(/\s+/).filter(Boolean);
-					const topic = rest.join(" ").trim();
+					const merge = rest.includes("--merge");
+					const topic = rest.filter((word) => word !== "--merge").join(" ").trim();
 					if (!ref || !topic) {
-						ctx.ui.notify("Usage: /memoria move <id|path|alias> <new broad topic>", "warning");
+						ctx.ui.notify("Usage: /memoria move <id|path|alias> <new broad topic> [--merge]", "warning");
 						return;
 					}
-					const moved = await runtime.move(ref, { topic }, "all");
+					const moved = await runtime.move(ref, { topic, merge }, "all");
 					if (!moved) {
 						ctx.ui.notify(`Memory not found: ${ref}`, "error");
 						return;
@@ -272,7 +273,7 @@ export function registerMemoriaCommand(pi: ExtensionAPI, getRuntime: RuntimeGett
 						lines.push("**Merge candidates** (same subject, two files):");
 						for (const merge of merges) {
 							lines.push(
-								`- \`${merge.a.relPath}\` ↔ \`${merge.b.relPath}\` (${Math.round(merge.score * 100)}% overlap: ${merge.shared.join(", ")}) → \`/memoria move ${merge.b.id} ${merge.a.title}\``,
+								`- \`${merge.a.relPath}\` ↔ \`${merge.b.relPath}\` (${Math.round(merge.score * 100)}% overlap: ${merge.shared.join(", ")}) → \`/memoria move ${merge.b.id} ${merge.a.title} --merge\``,
 							);
 						}
 					}

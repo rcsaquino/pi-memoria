@@ -286,13 +286,16 @@ must stay free of pi runtime imports so they remain testable in isolation.
    Runtime updates always `removeDoc(old)` then `addDoc(new)` — never `addDoc`
    alone for a note that already exists, or the same subject is indexed twice.
 4. **Identity is the id and the aliases, not the file name.** `moveMemory()` may
-   rename or merge a note, but it must keep the existing `id` (an id read earlier
-   in a session must stay valid) and record the previous topic, title and file
-   name as aliases. Merging must append through `appendFact()` so duplicates are
-   skipped, and must never overwrite the target's facts. Refuse to merge unless
-   the caller asked for it. Moves are journaled before the file becomes visible
-   and the journal is cleared after the source is trashed, so
-   `recoverJournal()` can complete an interrupted move on the next start.
+   rename or merge a note. A rename keeps its id; a merge keeps the target id
+   and records the source id as an alias, so an id read earlier still resolves.
+   Record the previous topic, title and file name as aliases too. Merging must
+   append through `appendFact()` so duplicates are skipped, preserve both notes'
+   `related` and `supersedes` links, and never overwrite the target's facts.
+   Refuse to merge unless the caller asked for it, or when alias/link limits
+   would discard existing references.
+   Moves are journaled before the destination changes; `recoverJournal()` only
+   trashes the source after verifying that a renamed target has the same id, or
+   that a merged target contains every source fact and its former id.
 5. **Search must not do filesystem I/O on the scoring path.** Bodies come from
    `bodyOrPreview()`; only final-hit snippets may touch the body cache/disk.
    Usage recording is in-memory and debounced, never synchronous disk I/O.
@@ -306,11 +309,15 @@ must stay free of pi runtime imports so they remain testable in isolation.
    `trimHot()` and the removed text is *returned to the caller*. Keep
    `hotTemplate()` minimal.
 7. **Writes are atomic** (`atomicWriteFile`) and soft-deleted files go to `.trash/`.
+   Trash names include a random suffix so two same-named notes deleted in one
+   millisecond cannot overwrite each other.
 8. **Index freshness**: after writing through `runtime.write`/`updateMemoryById`/
    `forget`/`move`/`import`, update the in-memory index directly; never rely on a
    rescan. External edits are caught by `index.refresh()` (watcher settle timer +
    TTL). Any mutation or external change must call `bumpCacheGeneration()`; a
-   stale cached search result after a write is a correctness bug.
+   stale cached search result after a write is a correctness bug. Check index
+   freshness before serving a cached search result, and key the cache on every
+   option that changes ranking or filtering, including weighted query parts.
 9. **Never throw from `before_agent_start`, `agent_end` or `session_shutdown`.**
    Recall and auto-learn failures must be swallowed with a notification; the turn
    must continue.
@@ -321,7 +328,9 @@ must stay free of pi runtime imports so they remain testable in isolation.
     survive; see the concurrency tests in `tests/runtime.test.ts`. The mutex is
     **not reentrant**: never call a runtime method that takes the root lock from
     inside `locks.run(root, …)` (import handles MEMORY.md by calling `writeHot`
-    directly).
+    directly). First loads of a root share one promise, and the extension
+    serializes runtime initialization, so concurrent calls cannot see a
+    half-loaded index or create separate runtimes.
 11. **Scope semantics.** `primary` is the user-level store and the default write
     target; `project` (when `projectRoot` is set) is writable; `extraRoots` are
     always read-only; `all` reads everything and writes to the primary store;
@@ -366,7 +375,9 @@ must stay free of pi runtime imports so they remain testable in isolation.
     queries disable the prefilter, and a missing, failing, timed-out or
     overflowing `rg` falls back to the full scan. The fallback reason is
     reported in `stats.ripgrep` and surfaced by the renderers, because a silent
-    slower scan on a large history can miss older sessions.
+    slower scan on a large history can miss older sessions. `readWindow` checks
+    both lexical and real paths so symlinks cannot escape the configured roots,
+    and refuses oversized transcripts.
 18. **Persistence changes bump `INDEX_VERSION`.** `hydrate()` must defensively
     fill fields added after the first release, because a stale or corrupt index
     must rebuild from markdown rather than fail. The binary format stores posting

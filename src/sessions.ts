@@ -25,7 +25,7 @@
 
 import { spawn } from "node:child_process";
 import { accessSync, constants, existsSync } from "node:fs";
-import { readdir, readFile, stat } from "node:fs/promises";
+import { readdir, readFile, realpath, stat } from "node:fs/promises";
 import { basename, delimiter, join, relative, resolve, sep } from "node:path";
 import { isCjkChar, stem, tokenize } from "./tokenize.ts";
 import { oneLine, truncateChars } from "./util.ts";
@@ -765,8 +765,29 @@ export class SessionStore {
 	 */
 	async readWindow(path: string, line: number, windowSize = 6): Promise<SessionReadResult | undefined> {
 		const target = resolve(path);
-		const root = this.roots.find((candidate) => target === resolve(candidate) || target.startsWith(`${resolve(candidate)}${sep}`));
-		if (!root || !existsSync(target)) return undefined;
+		if (!target.endsWith(".jsonl")) return undefined;
+		let realTarget: string;
+		let stats;
+		try {
+			[realTarget, stats] = await Promise.all([realpath(target), stat(target)]);
+		} catch {
+			return undefined;
+		}
+		if (!stats.isFile() || stats.size > MAX_FILE_BYTES) return undefined;
+		let root: string | undefined;
+		for (const candidate of this.roots) {
+			let realRoot: string;
+			try {
+				realRoot = await realpath(candidate);
+			} catch {
+				continue;
+			}
+			if (target.startsWith(`${resolve(candidate)}${sep}`) && realTarget.startsWith(`${realRoot}${sep}`)) {
+				root = candidate;
+				break;
+			}
+		}
+		if (!root) return undefined;
 		if (!Number.isFinite(line) || line < 1) return undefined;
 		const size = Math.max(0, Math.min(40, Math.floor(windowSize)));
 		const from = Math.max(1, Math.floor(line) - size);

@@ -524,6 +524,16 @@ test("readWindow returns surrounding dialogue and refuses unsafe paths", async (
 		assert.equal(window!.relPath, "--home-me-window--/2026-01-01T10-00-00-000Z_a.jsonl");
 		assert.equal(await store.readWindow("/etc/hostname", 1, 2), undefined, "paths outside the roots are refused");
 		assert.equal(await store.readWindow(join(root, "missing.jsonl"), 1, 2), undefined);
+		const outside = await mkdtemp(join(tmpdir(), "memoria-outside-session-"));
+		try {
+			const external = join(outside, "private.jsonl");
+			await writeFile(external, '{"type":"message","message":{"role":"user","content":"private"}}\n');
+			const linked = join(root, "linked.jsonl");
+			await symlink(external, linked);
+			assert.equal(await store.readWindow(linked, 1, 2), undefined, "symlinks outside the roots are refused");
+		} finally {
+			await rm(outside, { recursive: true, force: true });
+		}
 		assert.equal(await store.readWindow(path, 0, 2), undefined);
 		assert.equal((await store.readWindow(path, 2, 0))!.messages.length, 1, "a zero window returns just that line");
 	});

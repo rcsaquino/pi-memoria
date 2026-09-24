@@ -143,6 +143,8 @@ export class MemoriaRuntime {
 	config: MemoriaConfig = { ...DEFAULT_CONFIG };
 	roots: ResolvedRoots;
 	private stores = new Map<string, StoreState>();
+	/** Share one first load per root; callers never see a half-loaded index. */
+	private loadingStores = new Map<string, Promise<StoreState>>();
 	/** Serializes read-modify-write sequences per store root. */
 	private locks = new KeyedMutex();
 	private initialized = false;
@@ -262,27 +264,39 @@ export class MemoriaRuntime {
 			if (startWatcher) this.ensureWatcher(state);
 			return state;
 		}
-		const index = new MemoryIndex(root, {
-			bodyCacheBytes: this.config.bodyCacheBytes,
-			maxScanIntervalMs: this.config.scanIntervalMs,
-			exclude: this.config.exclude,
-			indexFormat: this.config.indexFormat,
-		});
-		const saver = createIndexSaver(index);
-		state = {
-			root,
-			index,
-			saver,
-			usageSaver: debounce(() => {
-				void this.flushUsage(root, state!).catch(() => {});
-			}, 4000),
-			pendingTouch: new Set(),
-		};
-		this.stores.set(root, state);
-		const recovered = await recoverJournal(root).catch(() => undefined);
-		if (recovered) state.recovered = recovered;
-		await index.load();
-		if (this.config.usageTracking) state.usage = await UsageStore.load(root).catch(() => undefined);
+		let loading = this.loadingStores.get(root);
+		if (!loading) {
+			loading = (async (): Promise<StoreState> => {
+				const index = new MemoryIndex(root, {
+					bodyCacheBytes: this.config.bodyCacheBytes,
+					maxScanIntervalMs: this.config.scanIntervalMs,
+					exclude: this.config.exclude,
+					indexFormat: this.config.indexFormat,
+				});
+				const saver = createIndexSaver(index);
+				const loaded: StoreState = {
+					root,
+					index,
+					saver,
+					usageSaver: debounce(() => {
+						void this.flushUsage(root, loaded).catch(() => {});
+					}, 4000),
+					pendingTouch: new Set(),
+				};
+				const recovered = await recoverJournal(root).catch(() => undefined);
+				if (recovered) loaded.recovered = recovered;
+				await index.load();
+				if (this.config.usageTracking) loaded.usage = await UsageStore.load(root).catch(() => undefined);
+				this.stores.set(root, loaded);
+				return loaded;
+			})();
+			this.loadingStores.set(root, loading);
+		}
+		try {
+			state = await loading;
+		} finally {
+			if (this.loadingStores.get(root) === loading) this.loadingStores.delete(root);
+		}
 		if (startWatcher) this.ensureWatcher(state);
 		return state;
 	}
@@ -338,6 +352,11 @@ export class MemoriaRuntime {
 		this.searchCache.clear();
 	}
 
+	/** Every refresh that changes an index must also invalidate cached recall. */
+	private async refreshIndex(index: MemoryIndex, force = false): Promise<void> {
+		if (await index.refresh(force)) this.bumpCacheGeneration();
+	}
+
 	/* ---------------------------------------------------------------- */
 	/* Search                                                            */
 	/* ---------------------------------------------------------------- */
@@ -358,6 +377,12 @@ export class MemoriaRuntime {
 			return { hits: [], total: 0, tookMs: 0, truncated: false, missing: [], byRoot: [] };
 		}
 		const limit = Math.max(1, options.limit ?? 8);
+		// A cached result is only valid after each root has had a chance to observe
+		// watcher events or its periodic freshness scan. Both checks are cheap when
+		// the index is already fresh.
+		const states = await Promise.all(roots.map((root) => this.storeFor(root)));
+		await Promise.all(states.map((state) => this.refreshIndex(state.index, options.refresh === true)));
+		const synonymTables = await Promise.all(states.map((state) => this.synonymsFor(state.root)));
 		const cacheKey = this.searchCacheKey(query, options);
 		const cached = this.lookupCache(cacheKey);
 		if (cached) {
@@ -367,16 +392,13 @@ export class MemoriaRuntime {
 		}
 
 		const perRoot = await Promise.all(
-			roots.map(async (root) => {
-				const state = await this.storeFor(root);
+			states.map(async (state, indexInRoots) => {
+				const root = state.root;
 				const index = state.index;
-				const refreshed = options.refresh ? await index.refresh(true) : await index.refresh(false);
-				if (refreshed) this.bumpCacheGeneration();
-				const synonyms = await this.synonymsFor(root);
-				const result = await index.search(query, {
+				const result = index.searchWarm(query, {
 					...options,
 					limit: Math.max(limit, 8),
-					synonyms,
+					synonyms: synonymTables[indexInRoots],
 					synonymWeight: this.config.synonymWeight,
 					snippetChars: this.config.snippetChars,
 					relatedHits: options.relatedHits ?? this.config.relatedHits,
@@ -474,7 +496,9 @@ export class MemoriaRuntime {
 	private searchCacheKey(query: string, options: SearchOptions & { scope?: Scope }): string {
 		const normalized = {
 			q: query,
+			parts: options.parts ?? [],
 			limit: options.limit ?? 8,
+			root: options.root ?? "",
 			category: options.category ?? "",
 			tags: options.tags ?? [],
 			anyTags: options.anyTags ?? [],
@@ -485,6 +509,10 @@ export class MemoriaRuntime {
 			prefix: options.prefix !== false,
 			fuzzy: options.fuzzy !== false,
 			expandRelated: options.expandRelated !== false,
+			relatedHits: options.relatedHits ?? this.config.relatedHits,
+			relatedBoost: options.relatedBoost ?? this.config.relatedBoost,
+			dropSuperseded: options.dropSuperseded === true,
+			timeHints: options.timeHints ?? this.config.timeHints,
 			explain: Boolean(options.explain),
 			scope: options.scope ?? "all",
 		};
@@ -967,7 +995,7 @@ export class MemoriaRuntime {
 		const out: Array<{ root: string; files: number }> = [];
 		for (const root of roots) {
 			const index = await this.indexFor(root);
-			await index.refresh(true);
+			await this.refreshIndex(index, true);
 			const docs: IndexListingDoc[] = index.liveDocs().map(({ meta }) => ({
 				relPath: meta.relPath,
 				title: meta.title,
@@ -994,9 +1022,10 @@ export class MemoriaRuntime {
 	async synonymsFor(root: string): Promise<Record<string, string[]>> {
 		const state = await this.storeFor(root);
 		const now = Date.now();
-		if (state.synonyms && now - state.synonyms.loadedAt < 30_000 && Object.keys(this.config.synonyms).length === 0) return state.synonyms.table;
+		if (state.synonyms && now - state.synonyms.loadedAt < 30_000) return state.synonyms.table;
 		const file = await loadSynonymsFile(root).catch(() => ({}));
 		const table = expandSynonymTable(mergeSynonymTables(this.config.synonyms, file));
+		if (state.synonyms && JSON.stringify(state.synonyms.table) !== JSON.stringify(table)) this.bumpCacheGeneration();
 		state.synonyms = { table, loadedAt: now };
 		return table;
 	}
@@ -1038,7 +1067,7 @@ export class MemoriaRuntime {
 		const out: MergeSuggestion[] = [];
 		for (const root of this.activeRoots(scope)) {
 			const index = await this.indexFor(root);
-			await index.refresh(false);
+			await this.refreshIndex(index);
 			out.push(...suggestMerges(this.similarityDocs(index), { threshold: this.config.dedupeThreshold, limit }));
 		}
 		return out.sort((a, b) => b.score - a.score).slice(0, limit);
@@ -1109,7 +1138,7 @@ export class MemoriaRuntime {
 		const out: Contradiction[] = [];
 		for (const root of this.activeRoots(scope)) {
 			const index = await this.indexFor(root);
-			await index.refresh(false);
+			await this.refreshIndex(index);
 			const units: Array<{ id: string; relPath: string; label?: string; text: string }> = [];
 			for (const { idx, meta } of index.liveDocs()) {
 				// Reading every body would make doctor O(store). A contradiction needs
@@ -1167,7 +1196,7 @@ export class MemoriaRuntime {
 		const out: TopicReportEntry[] = [];
 		for (const root of this.activeRoots(scope)) {
 			const state = await this.storeFor(root);
-			await state.index.refresh(false);
+			await this.refreshIndex(state.index);
 			const staleThreshold = this.config.staleAfterDays * 86_400_000;
 			const now = Date.now();
 			for (const { idx, meta } of state.index.liveDocs()) {
@@ -1208,7 +1237,7 @@ export class MemoriaRuntime {
 		state.usageSaver();
 		if (!previous) return undefined;
 		const index = state.index;
-		await index.refresh(false);
+		await this.refreshIndex(index);
 		const created: DiffEntry[] = [];
 		const updated: DiffEntry[] = [];
 		for (const { meta } of index.liveDocs()) {
@@ -1237,7 +1266,7 @@ export class MemoriaRuntime {
 		const updated: DiffEntry[] = [];
 		for (const root of this.activeRoots(scope)) {
 			const index = await this.indexFor(root);
-			await index.refresh(false);
+			await this.refreshIndex(index);
 			for (const { meta } of index.liveDocs()) {
 				const entry: DiffEntry = {
 					id: meta.id,
@@ -1266,7 +1295,7 @@ export class MemoriaRuntime {
 		let notes = 0;
 		for (const root of roots) {
 			const state = await this.storeFor(root);
-			await state.index.refresh(false);
+			await this.refreshIndex(state.index);
 			const hot = await readHot(root, this.config.hotLimit);
 			if (options.includeHot !== false && hot.exists && hot.content.trim()) {
 				lines.push(encodeJsonl({ type: "hot", root: this.displayPath(root), content: hot.content }));
@@ -1311,24 +1340,34 @@ export class MemoriaRuntime {
 		const records = decodeJsonl(text);
 		const result = { created: [] as string[], updated: [] as string[], skipped: 0, errors: records.errors, hotImported: false };
 		return this.locks.run(root, async () => {
-			for (const record of records.records) {
-				if (record.type === "hot") {
-					if (options.dryRun) continue;
-					// Already inside the root lock: call the store helpers directly.
-					await writeHot(root, record.content);
-					result.hotImported = true;
-					continue;
+			let changed = false;
+			let completed = false;
+			try {
+				for (const record of records.records) {
+					if (record.type === "hot") {
+						if (options.dryRun) continue;
+						// Already inside the root lock: call the store helpers directly.
+						await writeHot(root, record.content);
+						result.hotImported = true;
+						continue;
+					}
+					if (!options.dryRun) changed = true;
+					const outcome = await this.importNote(root, state, record, mode, options.dryRun === true);
+					if (!options.dryRun && outcome !== "skipped") changed = true;
+					if (outcome === "created") result.created.push(record.id);
+					else if (outcome === "updated") result.updated.push(record.id);
+					else result.skipped += 1;
 				}
-				const outcome = await this.importNote(root, state, record, mode, options.dryRun === true);
-				if (outcome === "created") result.created.push(record.id);
-				else if (outcome === "updated") result.updated.push(record.id);
-				else result.skipped += 1;
+				completed = true;
+				return result;
+			} finally {
+				if (changed) {
+					this.bumpCacheGeneration();
+					if (!completed) state.index.dirty = true;
+					state.index.builtAt = Date.now();
+					state.saver.schedule();
+				}
 			}
-			if (!options.dryRun) {
-				state.index.builtAt = Date.now();
-				state.saver.schedule();
-			}
-			return result;
 		});
 	}
 
@@ -1418,7 +1457,7 @@ export class MemoriaRuntime {
 		for (const root of this.activeRoots("all")) {
 			const state = await this.storeFor(root);
 			const index = state.index;
-			await index.refresh(true);
+			await this.refreshIndex(index, true);
 			const label = this.displayPath(root);
 			if (state.recovered) {
 				recovered.push(`${label}: ${state.recovered}`);
@@ -1512,7 +1551,7 @@ export class MemoriaRuntime {
 		let docs = 0;
 		for (const root of roots) {
 			const index = await this.indexFor(root);
-			await index.refresh(false);
+			await this.refreshIndex(index);
 			const overview = index.overview(recentLimit);
 			docs += overview.docs;
 			for (const [category, count] of overview.categories) counts.set(category, (counts.get(category) ?? 0) + count);
@@ -1532,7 +1571,7 @@ export class MemoriaRuntime {
 		const seenIds = new Set<string>();
 		for (const root of roots) {
 			const index = await this.indexFor(root);
-			await index.refresh(false);
+			await this.refreshIndex(index);
 			for (const { meta } of index.liveDocs()) {
 				// Ids are unique per store, not across stores: list a shared note once.
 				if (seenIds.has(meta.id)) continue;
@@ -1545,6 +1584,7 @@ export class MemoriaRuntime {
 
 	/** Flush pending index writes and stop watchers. Idempotent. */
 	async dispose(): Promise<void> {
+		await Promise.allSettled(this.loadingStores.values());
 		const stores = [...this.stores.values()];
 		this.stores = new Map();
 		this.initialized = false;
@@ -1636,4 +1676,3 @@ async function safeLoadConfig(root: string): Promise<MemoriaConfig> {
 		return { ...DEFAULT_CONFIG };
 	}
 }
-
