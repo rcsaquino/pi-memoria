@@ -139,7 +139,10 @@ export default function memoria(pi: ExtensionAPI) {
 			const result = await memoria_.recall(oneLine(prompt, 400), { limit: memoria_.config.autoRecallLimit, scope: "all", parts });
 			recentPrompts = [...recentPrompts, prompt].slice(-RECENT_PROMPT_LIMIT);
 			const hits = result.hits.filter((hit) => hit.score >= memoria_.config.autoRecallMinScore);
-			if (hits.length === 0) return undefined;
+			// Nothing in the library? Show what earlier conversations said instead
+			// of leaving the model with nothing to go on.
+			const sessionHits = hits.length === 0 ? result.sessionHits : undefined;
+			if (hits.length === 0 && (!sessionHits || sessionHits.length === 0)) return undefined;
 			const rendered = renderRecallBlock({
 				query: oneLine(prompt, 160),
 				hits,
@@ -147,13 +150,15 @@ export default function memoria(pi: ExtensionAPI) {
 				tookMs: result.tookMs,
 				missing: result.missing,
 				timeWindow: result.timeWindow,
+				sessionHits,
+				sessionStats: result.sessionStats,
 			});
 			return {
 				message: {
 					customType: RECALL_CUSTOM_TYPE,
 					content: rendered,
 					display: true,
-					details: { ids: hits.map((hit) => hit.doc.id), tookMs: result.tookMs },
+					details: { ids: hits.map((hit) => hit.doc.id), tookMs: result.tookMs, sessionHits: sessionHits?.length ?? 0 },
 				},
 			};
 		} catch (error) {
@@ -235,11 +240,15 @@ export default function memoria(pi: ExtensionAPI) {
 	});
 
 	pi.registerMessageRenderer(RECALL_CUSTOM_TYPE, (message, options, theme) => {
-		const details = message.details as { ids?: string[]; tookMs?: number } | undefined;
+		const details = message.details as { ids?: string[]; tookMs?: number; sessionHits?: number } | undefined;
 		const ids = details?.ids ?? [];
+		const summary =
+			ids.length > 0
+				? `recalled ${ids.length} ${ids.length === 1 ? "memory" : "memories"}`
+				: `searched past sessions (${details?.sessionHits ?? 0} match${(details?.sessionHits ?? 0) === 1 ? "" : "es"})`;
 		const header =
 			theme.fg("accent", theme.bold("memoria ")) +
-			theme.fg("muted", `recalled ${ids.length} ${ids.length === 1 ? "memory" : "memories"}`) +
+			theme.fg("muted", summary) +
 			theme.fg("dim", details?.tookMs !== undefined ? ` (${details.tookMs}ms)` : "");
 		const body = typeof message.content === "string" ? message.content : "";
 		const visible = options.expanded ? body : oneLine(body, 200);

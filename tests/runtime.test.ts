@@ -672,9 +672,14 @@ test("an interrupted move is repaired from the journal on the next start", async
 
 test("sessionDelta reports what changed since the previous session", async () => {
 	await withRuntime(async (runtime) => {
+		// Session markers have millisecond resolution, so leave a gap around each
+		// marker: a note written in the same millisecond belongs to *both* sessions
+		// (better a duplicate notification than a missed one).
+		const tick = () => new Promise((resolve) => setTimeout(resolve, 5));
 		// First session: no previous marker, nothing to report.
 		assert.equal(await runtime.sessionDelta(5), undefined);
 		await runtime.flushUsageNow();
+		await tick();
 		const note = await runtime.write({ topic: "Release window", content: "Releases go out on Tuesdays.", category: "workflows" });
 		const delta = await runtime.sessionDelta(5);
 		assert.ok(delta, "a recorded session marker enables the summary");
@@ -682,7 +687,9 @@ test("sessionDelta reports what changed since the previous session", async () =>
 		assert.equal(delta!.created[0].id, note.result.doc.id);
 		assert.deepEqual(delta!.updated, []);
 		// A quiet session reports nothing.
+		await tick();
 		await runtime.sessionDelta(5);
+		await tick();
 		const quiet = await runtime.sessionDelta(5);
 		assert.equal(quiet!.created.length, 0);
 		assert.equal(quiet!.updated.length, 0);

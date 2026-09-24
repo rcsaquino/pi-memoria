@@ -67,6 +67,13 @@ export const DEFAULT_CONFIG: MemoriaConfig = {
 	learnChunkChars: 12_000,
 	watcherSettleMs: 300,
 	indexFormat: "auto",
+	sessionSearch: true,
+	sessionRoots: [],
+	sessionFallback: true,
+	sessionScanMs: 1500,
+	sessionExcerptChars: 400,
+	sessionCacheBytes: 32 * 1024 * 1024,
+	sessionIncludeTools: false,
 };
 
 /** Filesystem context used to resolve store paths. */
@@ -155,6 +162,13 @@ function coerceConfig(raw: unknown): Partial<MemoriaConfig> {
 	if (number(input.learnChunkChars) !== undefined) out.learnChunkChars = Math.max(2000, number(input.learnChunkChars)!);
 	if (number(input.watcherSettleMs) !== undefined) out.watcherSettleMs = Math.max(0, Math.min(5000, number(input.watcherSettleMs)!));
 	if (str(input.indexFormat) && ["auto", "json", "binary"].includes(input.indexFormat as string)) out.indexFormat = input.indexFormat as string;
+	if (bool(input.sessionSearch) !== undefined) out.sessionSearch = bool(input.sessionSearch);
+	if (bool(input.sessionFallback) !== undefined) out.sessionFallback = bool(input.sessionFallback);
+	if (bool(input.sessionIncludeTools) !== undefined) out.sessionIncludeTools = bool(input.sessionIncludeTools);
+	if (number(input.sessionScanMs) !== undefined) out.sessionScanMs = Math.max(50, Math.min(60_000, number(input.sessionScanMs)!));
+	if (number(input.sessionExcerptChars) !== undefined) out.sessionExcerptChars = Math.max(80, Math.min(4000, number(input.sessionExcerptChars)!));
+	if (number(input.sessionCacheBytes) !== undefined) out.sessionCacheBytes = Math.max(0, number(input.sessionCacheBytes)!);
+	if (Array.isArray(input.sessionRoots)) out.sessionRoots = input.sessionRoots.filter((item): item is string => typeof item === "string");
 	if (input.synonyms && typeof input.synonyms === "object" && !Array.isArray(input.synonyms)) {
 		const table: Record<string, string[]> = {};
 		for (const [key, value] of Object.entries(input.synonyms as Record<string, unknown>)) {

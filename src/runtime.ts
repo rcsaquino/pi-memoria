@@ -16,7 +16,7 @@ import { existsSync } from "node:fs";
 import { watch, type FSWatcher } from "node:fs";
 import { homedir } from "node:os";
 import { basename, join, relative } from "node:path";
-import { DEFAULT_CONFIG, INDEX_DIR, LIBRARY_DIR, loadConfig, resolveRoots, type PathContext, type ResolvedRoots } from "./config.ts";
+import { DEFAULT_CONFIG, INDEX_DIR, LIBRARY_DIR, loadConfig, resolveRoots, resolveStorePath, type PathContext, type ResolvedRoots } from "./config.ts";
 import { MemoryIndex, createIndexSaver, isIgnoredWatchPath } from "./index-engine.ts";
 import {
 	addHotEntry,
@@ -49,6 +49,7 @@ import {
 	type MoveMemoryResult,
 	type UpdateMemoryInput,
 } from "./store.ts";
+import { SessionStore } from "./sessions.ts";
 import { UsageStore } from "./usage.ts";
 import { compareDocs, detectContradictions, isComparableTerm, suggestMerges, type SimilarityDoc } from "./similarity.ts";
 import { expandSynonymTable, loadSynonymsFile, mergeSynonymTables } from "./synonyms.ts";
@@ -64,6 +65,11 @@ import type {
 	SearchHit,
 	SearchOptions,
 	SearchResult,
+	SessionHit,
+	SessionReadResult,
+	SessionScanStats,
+	SessionSearchOptions,
+	SessionSearchResult,
 	StoreStats,
 	TimeWindow,
 } from "./types.ts";
@@ -95,6 +101,13 @@ export interface RuntimeSearchResult extends SearchResult {
 	cached?: boolean;
 	/** True when a model reranker reordered the hits. */
 	reranked?: boolean;
+	/**
+	 * Excerpts from past conversations, attached only when the library returned
+	 * nothing. These are evidence, not curated memory: the caller must label
+	 * them and point at `memoria_sessions` for verification.
+	 */
+	sessionHits?: SessionHit[];
+	sessionStats?: SessionScanStats;
 }
 
 export interface TopicReportEntry {
@@ -138,6 +151,8 @@ export class MemoriaRuntime {
 	private reranker?: Reranker;
 	private searchCache = new Map<string, { result: RuntimeSearchResult; generation: number; at: number }>();
 	private cacheGeneration = 0;
+	private sessionStore?: SessionStore;
+	private sessionStoreKey = "";
 
 	/**
 	 * @param cwd  Working directory of the session (only used for relative paths).
@@ -187,6 +202,7 @@ export class MemoriaRuntime {
 	/** Replace the active configuration and rebuild stores (used when config changes). */
 	async reconfigure(config: MemoriaConfig): Promise<void> {
 		await this.dispose();
+		this.clearSessionCache();
 		this.config = config;
 		this.roots = resolveRoots(this.cwd, this.config, this.pathContext);
 		await this.init(true, false);
@@ -411,8 +427,23 @@ export class MemoriaRuntime {
 	}
 
 	/** Search, then optionally reorder the top candidates with the model. */
-	async recall(query: string, options: SearchOptions & { scope?: Scope; rerank?: boolean } = {}): Promise<RuntimeSearchResult> {
+	async recall(query: string, options: SearchOptions & { scope?: Scope; rerank?: boolean; sessionFallback?: boolean } = {}): Promise<RuntimeSearchResult> {
 		const result = await this.search(query, options);
+		// "Not in memory" is the case session transcripts exist for: attach a
+		// small, clearly-labelled set of excerpts so the model can check what was
+		// actually said before claiming it does not know.
+		if (result.hits.length === 0 && options.sessionFallback !== false && this.config.sessionFallback) {
+			const fallback = await this.sessionSearch(query, {
+				limit: 2,
+				// The fallback runs inside a prompt, so it gets a small slice of the
+				// search budget; the explicit tool call can take longer.
+				budgetMs: Math.min(this.config.sessionScanMs, 400),
+			}).catch(() => undefined);
+			if (fallback && fallback.hits.length > 0) {
+				result.sessionHits = fallback.hits;
+				result.sessionStats = fallback.stats;
+			}
+		}
 		const wanted = options.rerank ?? this.config.rerank;
 		if (!wanted || !this.reranker || result.hits.length < 2) return result;
 		const topK = Math.max(2, Math.min(this.config.rerankTopK, result.hits.length));
@@ -529,6 +560,79 @@ export class MemoriaRuntime {
 			await this.flushUsage(state.root, state).catch(() => {});
 		}
 	}
+
+	/* ---------------------------------------------------------------- */
+	/* Past sessions                                                     */
+	/* ---------------------------------------------------------------- */
+
+	/** Roots searched for saved transcripts: config extras first, then pi's own. */
+	sessionRoots(): string[] {
+		const roots: string[] = [];
+		const push = (root: string): void => {
+			if (root && !roots.includes(root)) roots.push(root);
+		};
+		for (const extra of this.config.sessionRoots) {
+			const resolved = resolveStorePath(extra, this.cwd, this.pathContext);
+			if (resolved) push(resolved);
+		}
+		push(join(this.pathContext.agentDir, "sessions"));
+		push(join(this.pathContext.agentDir, "sessions-archive"));
+		return roots;
+	}
+
+	/** Lazily create the transcript store (keys on config + agent dir). */
+	private sessions(): SessionStore {
+		const roots = this.sessionRoots();
+		const key = `${roots.join("|")}::${this.config.sessionCacheBytes}::${this.config.sessionExcerptChars}`;
+		if (!this.sessionStore || this.sessionStoreKey !== key) {
+			this.sessionStore = new SessionStore({
+				roots,
+				cacheBytes: this.config.sessionCacheBytes,
+				excerptChars: this.config.sessionExcerptChars,
+			});
+			this.sessionStoreKey = key;
+		}
+		return this.sessionStore;
+	}
+
+	/**
+	 * Search saved session transcripts. Read-only, bounded and always safe to
+	 * call: a missing sessions directory yields an empty result.
+	 */
+	async sessionSearch(query: string, options: SessionSearchOptions = {}): Promise<SessionSearchResult> {
+		const empty: SessionSearchResult = {
+			hits: [],
+			stats: { roots: [], files: 0, messages: 0, bytes: 0, cachedFiles: 0, skipped: 0, partial: false },
+			tookMs: 0,
+		};
+		if (!this.config.sessionSearch) return empty;
+		const store = this.sessions();
+		const haveRoots = store.roots.some((root) => existsSync(root));
+		if (!haveRoots) return { ...empty, stats: { ...empty.stats, roots: store.roots } };
+		const result = await store.search(query, {
+			...options,
+			includeTools: options.includeTools ?? this.config.sessionIncludeTools,
+			budgetMs: options.budgetMs ?? this.config.sessionScanMs,
+		});
+		this.lastSessionSearchMs = result.tookMs;
+		return result;
+	}
+
+	/** Read a window of a transcript around a hit line (verification step). */
+	async sessionRead(path: string, line: number, window = 6): Promise<SessionReadResult | undefined> {
+		if (!this.config.sessionSearch) return undefined;
+		return this.sessions().readWindow(path, line, window);
+	}
+
+	/** Drop the transcript cache (used when config changes). */
+	clearSessionCache(): void {
+		this.sessionStore?.clear();
+		this.sessionStore = undefined;
+		this.sessionStoreKey = "";
+	}
+
+	/** Milliseconds of the last transcript scan, for status reporting. */
+	lastSessionSearchMs = 0;
 
 	/* ---------------------------------------------------------------- */
 	/* Writes                                                            */
@@ -1456,7 +1560,7 @@ export class MemoriaRuntime {
 	}
 
 	/** Absolute path helpers used by tools/commands. */
-	paths(): { primary: string; project: string; agentDir: string; extras: string[]; library: string; hot: string; indexDir: string } {
+	paths(): { primary: string; project: string; agentDir: string; extras: string[]; library: string; hot: string; indexDir: string; sessions: string[] } {
 		return {
 			primary: this.roots.primary,
 			project: this.roots.project,
@@ -1465,6 +1569,7 @@ export class MemoriaRuntime {
 			library: join(this.roots.primary, LIBRARY_DIR),
 			hot: join(this.roots.primary, "MEMORY.md"),
 			indexDir: join(this.roots.primary, INDEX_DIR),
+			sessions: this.sessionRoots(),
 		};
 	}
 

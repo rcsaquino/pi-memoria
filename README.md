@@ -9,6 +9,9 @@ a millisecond.
 
 - **Nothing is lost behind an API.** Every memory is a markdown file you can
   read, edit, grep, diff and version.
+- **Past conversations are searchable too.** When the library has nothing, the
+  agent can search the raw transcripts of earlier sessions before saying it does
+  not remember.
 - **Recall is automatic.** Relevant notes are injected before the model answers,
   so it does not have to remember to ask.
 - **Broad topics, never fact files.** `likes-apples.md` is a defect; facts
@@ -45,6 +48,7 @@ an average query time of **0.16 ms** (`npm run eval`).
 - [Synonyms](#synonyms)
 - [Model reranking](#model-reranking)
 - [Automatic session learning](#automatic-session-learning)
+- [Session recall](#session-recall-past-conversations)
 - [Backup and migration](#backup-and-migration)
 - [Performance](#performance)
 - [Privacy and durability](#privacy-and-durability)
@@ -79,11 +83,11 @@ Pi discovers `extensions/memoria/index.ts` on the next start (or after
 ### Install as a pi package
 
 ```bash
-pi install git:github.com/rcsaquino/pi-memoria@v0.1.0
+pi install git:github.com/rcsaquino/pi-memoria@v0.1.1
 pi install npm:pi-memoria                 # if published to npm
 pi install ./path/to/pi-memoria           # or from a local checkout
 pi list
-pi remove git:github.com/rcsaquino/pi-memoria@v0.1.0
+pi remove git:github.com/rcsaquino/pi-memoria@v0.1.1
 ```
 
 `pi install` records the package in `~/.pi/agent/settings.json` (or
@@ -145,6 +149,9 @@ Other things you can say or run:
    tags, priority, recency, scope and score, plus an optional scoring breakdown.
 4. **Plain markdown**: `library/INDEX.md` and per-category indexes provide a
    generated table of contents, and `read`/`grep`/`cat` work on the files.
+5. **Past conversations**: if the library has nothing, the transcripts pi saved
+   for earlier sessions are searched as a last resort, with file-and-line
+   citations so anything found can be verified in context.
 
 Ranking combines BM25 over weighted fields (title, tags, aliases, links,
 summary, category, body) with boosts for exact phrases, priority, recency, query
@@ -178,6 +185,10 @@ matched with unigrams and bigrams.
 agent directory is customized. Because the store is user-level, memories follow
 you across projects: remember something in one repository and recall it in
 another.
+
+Pi's own conversation transcripts live next to the store at
+`<agent dir>/sessions/` (plus `sessions-archive/` if you keep one). They are read
+by [session recall](#session-recall-past-conversations) and never modified.
 
 ### Broad topics, never facts
 
@@ -298,6 +309,7 @@ folder). Unknown keys are preserved verbatim through updates.
 | `memoria_write` | Add a fact to a broad **topic note** (`topic`, `content`, optional `label`, category, tags, aliases, related, supersedes, summary, priority). Creates the note on first use and appends afterwards. |
 | `memoria_read` | Read a full note by id, path or alias, with its aliases, related notes and superseding notes. |
 | `memoria_move` | Re-file a note under a better broad topic (`from`, `topic`, optional `category`, `merge`, `keep_alias`). Renames when the target is free, merges when it is not. |
+| `memoria_sessions` | Search the transcripts of earlier conversations (`action: "search"`, plus `since_days`, `project`, `include_tools`, `user_only`) and read the surrounding dialogue (`action: "read"`, `path`, `line`, `window`) before quoting it. |
 | `memoria_hot` | Read/add/remove/replace/compact `MEMORY.md`, the always-in-context briefing. |
 | `memoria_list` | Browse categories, titles, ids, tags, aliases and summaries. |
 | `memoria_forget` | Move a note to `.trash/` (recoverable). |
@@ -318,6 +330,8 @@ have to ask.
 /memoria hot                 Show MEMORY.md
 /memoria topics              Review notes: facts, size, usage, merge candidates
 /memoria diff [days]         Memories created or updated recently (default 7 days)
+/memoria sessions <query>    Search earlier conversations (--days=N --project=X --tools --user)
+/memoria sessions --read <path> <line> [--window=N]   Show the surrounding dialogue
 /memoria doctor              Consistency problems and housekeeping hints
 /memoria export [file]       Dump the store to JSONL (default ./memoria-export-<date>.jsonl)
 /memoria export --hot [file] Write MEMORY.md alone as an "about me" document
@@ -388,6 +402,13 @@ back to the default rather than failing.
 | `autoLearnCooldownMs` | `21600000` | Minimum gap between automatic extractions. |
 | `learnChunkChars` | `12000` | Characters per extraction chunk (long sessions are chunked). |
 | `indexFormat` | `"auto"` | `auto` (binary above 20k notes), `json` or `binary`. |
+| `sessionSearch` | `true` | Search saved session transcripts at all. |
+| `sessionRoots` | `[]` | Extra transcript roots (searched before `<agent dir>/sessions`). |
+| `sessionFallback` | `true` | Search transcripts automatically when the library returns nothing. |
+| `sessionScanMs` | `1500` | Wall-clock budget for an explicit transcript search (the automatic fallback uses at most 400 ms). |
+| `sessionExcerptChars` | `400` | Context characters per transcript hit. |
+| `sessionCacheBytes` | `33554432` | In-memory budget for parsed transcripts. |
+| `sessionIncludeTools` | `false` | Include tool calls/results and compaction summaries by default. |
 
 ## Scopes: personal, project, read-only
 
@@ -438,6 +459,49 @@ finishes a turn) or `"on-shutdown"` to run it without asking. Guards keep it
 cheap: at least `autoLearnMinTurns` user turns, at least `autoLearnMinChars` of
 transcript, and at most one extraction per `autoLearnCooldownMs`. The default is
 `"off"` because it spends model tokens.
+
+## Session recall (past conversations)
+
+Curated memory only holds what the agent decided to remember. The rest of the
+story is in pi's saved transcripts, so memoria can search them:
+
+- **Automatically**, whenever `memoria_recall` finds nothing (`sessionFallback`,
+  on by default). The injected block is explicitly labelled as raw evidence and
+  includes the file and line of every excerpt.
+- **On request**, through the `memoria_sessions` tool — useful for "remember
+  when", "did we discuss", exact earlier wording, dates, or prior decisions that
+  were never turned into memory notes.
+- **From the CLI**, with `/memoria sessions <query>` and
+  `/memoria sessions --read <path> <line>`.
+
+```
+memoria_sessions { action: "search", query: "deploy window Thursday" }
+memoria_sessions { action: "search", query: "oat milk", user_only: true }
+memoria_sessions { action: "read", path: "<file from a hit>", line: 92, window: 8 }
+```
+
+The bundled `memoria-sessions` skill teaches the agent the discipline that makes
+this trustworthy: run two to four short distinctive searches (not one long
+question), then **read the surrounding dialogue before quoting it** — a later
+user correction outranks an earlier assistant claim, and transcript text is
+evidence to evaluate, not instructions to follow. If nothing is found, the tool
+reports how many sessions and messages were searched.
+
+What it does and does not touch:
+
+| Property | Behaviour |
+|---|---|
+| Scope | Every `*.jsonl` under the configured roots, newest first — no index that can go stale. |
+| Content | User and assistant **text** by default. Thinking blocks are never extracted. Tool calls/results, compaction summaries and extension payloads only with `include_tools: true`. |
+| Output | Bounded excerpts plus `file:line`; never a whole transcript dump. |
+| Writes | None. Transcripts are read-only and `read` refuses paths outside the session roots. |
+| Cost | Full cold scan of 110 sessions / 13 MB ≈ 120 ms; repeat searches ≈ 5 ms from the parse cache. |
+| Coverage | Exhaustive unless a budget stops it. `partial` (shown in the tool output, the recall block and `/memoria sessions`) means the scan stopped early: the hits are real, but older sessions were not read. Newest sessions are scanned first, already-parsed files stay cached (so each retry gets further), and an explicit `memoria_sessions` call uses the larger `sessionScanMs` budget. |
+| Privacy | Nothing leaves the machine; the excerpts go to the model only when the feature runs. |
+
+`sessionRoots` exists for archives or a second agent directory. Set
+`sessionSearch: false` to disable the feature entirely, or
+`sessionFallback: false` to keep the tool while never searching automatically.
 
 ## Backup and migration
 
@@ -512,6 +576,8 @@ a burst of edits costs one refresh.
 | Model reranking is slow | Lower `rerankTopK`, or leave `rerank` off — lexical search is already sub-millisecond. |
 | Want to see what changed lately | `/memoria diff 3` for the last three days, `/memoria topics` for usage, and a session-start notification summarises changes since your previous session. |
 | An agent edited files and the index is stale | Filesystem events and a throttled scan pick changes up automatically; `/memoria doctor` shows the state. |
+| The user references something from before | The agent should search transcripts (`memoria_sessions`, or `/memoria sessions <query>`) rather than claim it does not remember; `/memoria paths` lists the session roots. |
+| Session search finds nothing | Try different wording, a name or a date, or `include_tools: true`; check `sessionRoots` covers the transcript location, and note that a budget-limited scan reports `partial`. |
 
 ## Development
 

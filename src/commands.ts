@@ -5,6 +5,7 @@
  * rendered as markdown in interactive mode.
  */
 
+import { existsSync } from "node:fs";
 import { isAbsolute, resolve } from "node:path";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { getMarkdownTheme } from "@earendil-works/pi-coding-agent";
@@ -12,6 +13,7 @@ import { Markdown, Text } from "@earendil-works/pi-tui";
 import type { MemoriaRuntime } from "./runtime.ts";
 import type { RuntimeGetter } from "./tools.ts";
 import { harvestSession } from "./learn.ts";
+import { formatSessionTime } from "./sessions.ts";
 import { describeAge } from "./usage.ts";
 import { atomicWriteFile, oneLine } from "./util.ts";
 import type { Scope } from "./types.ts";
@@ -30,6 +32,7 @@ const SUBCOMMANDS: Array<{ value: string; label: string; description: string }> 
 	{ value: "doctor", label: "doctor", description: "Check the store for consistency problems" },
 	{ value: "topics", label: "topics", description: "Review notes: size, facts, usage, merge candidates" },
 	{ value: "diff", label: "diff [days]", description: "Show memories created or updated recently" },
+	{ value: "sessions", label: "sessions <query>", description: "Search earlier conversations (raw transcripts)" },
 	{ value: "export", label: "export [file]", description: "Dump the store to JSONL" },
 	{ value: "import", label: "import <file>", description: "Restore memories from a JSONL export" },
 	{ value: "learn", label: "learn", description: "Extract durable memories from the current session" },
@@ -71,6 +74,9 @@ async function statusMarkdown(runtime: MemoriaRuntime): Promise<string> {
 	lines.push("");
 	lines.push(`**Auto-recall:** ${runtime.config.autoRecall ? `on (limit ${runtime.config.autoRecallLimit}, min score ${runtime.config.autoRecallMinScore})` : "off"} | **auto-learn:** ${runtime.config.autoLearn}`);
 	lines.push(`**Index:** ${runtime.config.indexFormat} | **rerank:** ${runtime.config.rerank ? runtime.config.rerankModel || "session model" : "off"} | **synonym table:** ${Object.keys(runtime.config.synonyms).length} inline`);
+	lines.push(
+		`**Session recall:** ${runtime.config.sessionSearch ? (runtime.config.sessionFallback ? "on (falls back when memory is empty)" : "on (explicit only)") : "off"} | roots: ${runtime.sessionRoots().filter((root) => existsSync(root)).length}`,
+	);
 	return lines.join("\n");
 }
 
@@ -272,6 +278,60 @@ export function registerMemoriaCommand(pi: ExtensionAPI, getRuntime: RuntimeGett
 					emit(pi, "memoria topics", lines.join("\n"));
 					return;
 				}
+				case "sessions": {
+					const flags = remainder.split(/\s+/).filter(Boolean);
+					const readIndex = flags.indexOf("--read");
+					if (readIndex >= 0) {
+						const path = flags[readIndex + 1];
+						const line = Number.parseInt(flags[readIndex + 2] ?? "1", 10);
+						const windowFlag = flags.find((flag) => flag.startsWith("--window="));
+						const window = windowFlag ? Number.parseInt(windowFlag.slice(9), 10) : 6;
+						if (!path) {
+							ctx.ui.notify("Usage: /memoria sessions --read <path> <line> [--window=6]", "warning");
+							return;
+						}
+						const found = await runtime.sessionRead(path, Number.isFinite(line) ? line : 1, Number.isFinite(window) ? window : 6);
+						if (!found) {
+							ctx.ui.notify("No transcript window there. Paths must come from a /memoria sessions search.", "error");
+							return;
+						}
+						const lines = [`\`${found.relPath}\` · project **${found.projectName}** · lines ${found.startLine}-${found.endLine}`, ""];
+						for (const message of found.messages) {
+							lines.push(`- **[${message.line}] ${message.role}** ${formatSessionTime(message.timestamp)}: ${oneLine(message.text, 1200)}`);
+						}
+						emit(pi, "memoria sessions: window", lines.join("\n"));
+						return;
+					}
+					const daysFlag = flags.find((flag) => flag.startsWith("--days="));
+					const projectFlag = flags.find((flag) => flag.startsWith("--project="));
+					const query = flags.filter((flag) => !flag.startsWith("--")).join(" ");
+					if (!query) {
+						ctx.ui.notify("Usage: /memoria sessions <query> [--days=N] [--project=name] [--tools] [--user]", "warning");
+						return;
+					}
+					const result = await runtime.sessionSearch(query, {
+						limit: 10,
+						sinceDays: daysFlag ? Number.parseInt(daysFlag.slice(7), 10) : undefined,
+						project: projectFlag ? projectFlag.slice(10) : undefined,
+						includeTools: flags.includes("--tools"),
+						userOnly: flags.includes("--user"),
+					});
+					const stats = result.stats;
+					const header = `${result.hits.length} match${result.hits.length === 1 ? "" : "es"} in ${stats.files} sessions / ${stats.messages} messages (${result.tookMs}ms${stats.partial ? ", partial scan" : ""}${stats.skipped > 0 ? `, ${stats.skipped} unreadable records skipped` : ""}).`;
+					if (result.hits.length === 0) {
+						emit(pi, `memoria sessions: ${oneLine(query, 60)}`, `${header}\n\nNo saved conversation matched. Try other wording, a name or a date.`);
+						return;
+					}
+					const lines = [header, "", "_Evidence from raw transcripts, not curated memory._", ""];
+					for (const hit of result.hits) {
+						lines.push(`- **[${hit.role}] ${formatSessionTime(hit.timestamp)}** · ${hit.projectName} · score ${hit.score}${hit.exact ? " · exact" : ""}`);
+						lines.push(`  ${oneLine(hit.excerpt, 400)}`);
+						lines.push(`  \`${hit.path}:${hit.line}\` · matched: ${hit.matched.join(", ") || "-"}`);
+					}
+					lines.push("", `Verify context: \`/memoria sessions --read <path> <line>\``);
+					emit(pi, `memoria sessions: ${oneLine(query, 60)}`, lines.join("\n"));
+					return;
+				}
 				case "diff": {
 					const days = remainder ? Number.parseInt(remainder, 10) : 7;
 					const report = await runtime.diffReport(Number.isFinite(days) ? days : 7);
@@ -376,6 +436,7 @@ export function registerMemoriaCommand(pi: ExtensionAPI, getRuntime: RuntimeGett
 							`- library: \`${runtime.displayPath(paths.library)}\``,
 							`- index: \`${runtime.displayPath(paths.indexDir)}\``,
 							...paths.extras.map((extra) => `- extra root: \`${runtime.displayPath(extra)}\``),
+							...paths.sessions.map((root) => `- session root: \`${runtime.displayPath(root)}\`${existsSync(root) ? "" : " _(missing)_"}`),
 						].join("\n"),
 					);
 					return;

@@ -27,10 +27,15 @@ A pi extension that gives the agent long-term memory:
 - `memoria/synonyms.json` — optional query-side synonym table (e.g. `k8s` → `kubernetes`).
 - An in-memory inverted index (`memoria/.index/index.json` or `index.bin`) for
   sub-millisecond recall, plus `.index/usage.json` for hits/writes/last-used.
-- Nine tools (`memoria_recall`, `memoria_write`, `memoria_read`, `memoria_move`,
+- Pi's saved conversation transcripts (`<agent dir>/sessions/`) are searchable as
+  a last resort: `memoria_sessions`, an automatic fallback when the library
+  returns nothing, and `/memoria sessions`. Results are raw evidence with
+  `file:line` citations, never merged into the library.
+- Ten tools (`memoria_recall`, `memoria_write`, `memoria_read`, `memoria_move`,
   `memoria_hot`, `memoria_list`, `memoria_forget`, `memoria_export`,
-  `memoria_import`), a `/memoria` command with subcommands, and a skill
-  (`skills/memoria/SKILL.md`) that teaches an agent how to maintain the store.
+  `memoria_import`, `memoria_sessions`), a `/memoria` command with subcommands,
+  and two skills: `skills/memoria/SKILL.md` (store maintenance) and
+  `skills/memoria-sessions/SKILL.md` (searching and verifying transcripts).
 
 The extension itself lives in this repository. The *store* it manages is
 user-level, not per-project: `<agent dir>/memoria`, i.e. `~/.pi/agent/memoria`
@@ -50,7 +55,8 @@ per-project store; `extraRoots` are always read-only additions.
 1. **Zero-effort recall.** Memories surface automatically on every user prompt,
    not only when the model chooses to call a tool. The agent is additionally
    instructed (in the system prompt) to search before answering anything about
-   people, preferences, projects, decisions, or history.
+   people, preferences, projects, decisions, or history, and to search the raw
+   session transcripts (`memoria_sessions`) before claiming it does not remember.
 2. **Curated hot memory.** `MEMORY.md` is always in the system prompt, capped at
    5000 characters, and answers one question: *what should the agent know before
    it reads a single message?* In practice: who the user is, how they like to
@@ -138,6 +144,10 @@ Layers 1 and 2 are the guarantee. Layers 3–5 are the escape hatches.
   are demoted and flagged rather than silently contradicting.
 - **Scope**: cross-store results are rank-normalized so a small store is not
   drowned, and a note present in two stores is returned once.
+- **Transcripts**: earlier conversations are searchable by phrase and term
+  (identifiers, stems, CJK) with `file:line` citations, and hits can be read in
+  context; a later user correction outranks an earlier assistant claim because
+  the agent is told (skill + system prompt) to verify before quoting.
 - **Filters**: category, tags, priority, recency, unfiled, scope.
 - **Topic grouping**: related facts live in one note, so a hit brings its
   context with it and `memoria_read` on the topic shows the full picture.
@@ -231,6 +241,8 @@ src/usage.ts              hits/writes/last-used tracking (.index/usage.json).
 src/timeexpr.ts           "last week" → time windows.
 src/synonyms.ts           Query-side synonym tables (config + synonyms.json).
 src/transfer.ts           JSONL export/import with path sanitizing.
+src/sessions.ts           Transcript search: pi JSONL parsing, cache, ranking,
+                          bounded excerpts, window reads (read-only).
 src/recall.ts             Rendering of the system section and recall block.
 src/learn.ts              Session harvesting: chunking, prompt building, parsing.
 src/rerank.ts             Optional best-effort model reranker.
@@ -243,9 +255,10 @@ skills/memoria/SKILL.md   Maintenance instructions for other agents.
 ```
 
 Dependency direction is one-way: `types/util → tokenize/frontmatter → store →
-index-engine → search → recall/learn → runtime → tools/commands → index.ts`.
-Never import upward from a lower layer; `store.ts` and `search.ts` must stay free
-of pi runtime imports so they remain testable in isolation.
+index-engine → search → recall/learn → runtime → tools/commands → index.ts`,
+with `sessions.ts` (like `store.ts`) importing only from `types/util/tokenize`.
+Never import upward from a lower layer; `store.ts`, `search.ts` and `sessions.ts`
+must stay free of pi runtime imports so they remain testable in isolation.
 
 ## Invariants (do not break these)
 
@@ -327,7 +340,21 @@ of pi runtime imports so they remain testable in isolation.
 16. **Optional features degrade, they never break.** Synonyms, reranking, usage
     tracking, auto-learn, time hints and related expansion must all be safe to
     disable or fail: fall back to lexical order/plain behaviour and continue.
-17. **Persistence changes bump `INDEX_VERSION`.** `hydrate()` must defensively
+17. **Session search is read-only, bounded and honest.** `src/sessions.ts` never
+    writes a transcript; `readWindow` refuses paths outside the configured roots;
+    only user/assistant text is extracted by default (thinking blocks must never
+    be surfaced, tool content only with `includeTools`); excerpts, messages,
+    results and the scan itself are capped, and a budget-limited scan reports
+    `partial` instead of pretending the corpus was fully searched. The budget
+    covers the directory walk as well as parsing (checked before every file, so
+    the overshoot is at most one file), files are scanned newest-first, and a
+    listing is capped at `MAX_SESSION_FILES` — a starved scan must still return
+    promptly and say its coverage was incomplete. Hits are
+    labelled as evidence, and `recall()` attaches them **only** when the library
+    returned nothing. A transcript parse is cached per file keyed by mtime+size
+    and by variant (core vs includeTools) — a core parse must never be reused to
+    answer an `includeTools` search.
+18. **Persistence changes bump `INDEX_VERSION`.** `hydrate()` must defensively
     fill fields added after the first release, because a stale or corrupt index
     must rebuild from markdown rather than fail. The binary format stores posting
     weights as `float32`; that is exact for this system's dyadic tf weights
@@ -342,6 +369,12 @@ of pi runtime imports so they remain testable in isolation.
   recovery, export/import, reranking and project scopes.
 - `tests/engine.test.ts` covers index persistence (JSON and binary round-trips,
   corrupt-file recovery), watch filtering and link resolution.
+- `tests/sessions.test.ts` builds synthetic transcripts in pi's JSONL shape and
+  covers extraction (thinking/tool exclusion), ranking, filters, corruption and
+  symlink skipping, cache invalidation, budgets, window reads and path refusals,
+  plus the runtime fallback and the tool. Keep a fixture with a user *correction*
+  after an assistant claim: applying the correction is the behaviour that makes
+  session recall trustworthy.
 - `tests/extension.test.ts` drives the real extension factory with a fake
   `ExtensionAPI`, asserting on registered tools, captured events and rendered
   output. Extend this whenever you add a tool or lifecycle hook.
@@ -391,6 +424,14 @@ the per-root lock. `memoria_move` in `src/tools.ts` and `/memoria move` in
 `merge: true`" guard: silently mixing two subjects into one file is worse than a
 failed move.
 
+**Change session search.** `src/sessions.ts` holds discovery, parsing, ranking
+and window reads; `MemoriaRuntime.sessionSearch/sessionRead` own configuration
+and the lazily created store; `renderSessionFallback` in `src/recall.ts` renders
+the evidence block for both the tool and auto-recall. New transcript entry types
+(`compaction`, `custom`, …) go behind `includeTools` unless they are genuine
+conversation turns. Bump the excerpt/message caps only with a test that proves
+the output stays bounded.
+
 **Change what is injected into prompts.** `src/recall.ts`
 `renderSystemSection` (stable section, cache-friendly) and `renderRecallBlock`
 (per-prompt message). Respect the character budgets and keep the "you must
@@ -439,6 +480,11 @@ from `/memoria` and `memoria doctor`. Keep the search path out of it.
   Nested acquisition deadlocks.
 - Import files are untrusted data: always go through `sanitizeRelPath()`, never
   `join(root, untrusted)`.
+- Session transcripts are pi's files, not ours: never write them, never assume
+  their schema is stable, and always tolerate unparsable lines (they are counted
+  as `skipped`, not fatal). `custom_message` entries are injected context (a
+  recall block is written into the transcript), so they are deliberately not
+  searchable, or the store would quote itself.
 - Duplicate detection is deliberately conservative: `compareDocs()` requires a
   *name link* (`namesLinked`) before reporting content overlap, because two
   different people who share a paragraph (John Doe and his father) otherwise look
@@ -476,3 +522,5 @@ Package-shape invariants live in
    and design intent.
 5. New config keys appear in `DEFAULT_CONFIG`, `coerceConfig` and the README
    table, and are actually read somewhere.
+6. New skills under `skills/` have `name`/`description` frontmatter (the
+   description is what tells the model when to load them).

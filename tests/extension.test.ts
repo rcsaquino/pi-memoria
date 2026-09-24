@@ -123,6 +123,7 @@ test("registers the memoria tools and the /memoria command", async () => {
 				"memoria_move",
 				"memoria_read",
 				"memoria_recall",
+				"memoria_sessions",
 				"memoria_write",
 			],
 		);

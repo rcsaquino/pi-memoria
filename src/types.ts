@@ -416,4 +416,118 @@ export interface MemoriaConfig {
 	watcherSettleMs: number;
 	/** Index persistence format: auto (binary above a threshold), json or binary. */
 	indexFormat: string;
+	/** Search pi's saved session transcripts (past conversations). */
+	sessionSearch: boolean;
+	/** Extra session roots, in addition to `<agent dir>/sessions[-archive]`. */
+	sessionRoots: string[];
+	/** Search sessions automatically when the library returns nothing. */
+	sessionFallback: boolean;
+	/** Budget for an explicit session search, in milliseconds. */
+	sessionScanMs: number;
+	/** Characters of context per session hit. */
+	sessionExcerptChars: number;
+	/** In-memory budget for parsed session messages. */
+	sessionCacheBytes: number;
+	/** Include tool calls, tool results and compaction summaries by default. */
+	sessionIncludeTools: boolean;
+}
+
+/* ------------------------------------------------------------------ */
+/* Session transcripts (past conversations)                            */
+/* ------------------------------------------------------------------ */
+
+/** One searchable message extracted from a saved session transcript. */
+export interface SessionMessage {
+	/** 1-based line in the transcript file. */
+	line: number;
+	/** Who produced the text. `summary` is a compaction summary, `tool` derived output. */
+	role: "user" | "assistant" | "tool" | "summary";
+	/** Epoch ms of the entry. */
+	timestamp: number;
+	/** Extracted text, capped per message. */
+	text: string;
+	/** Normalized text used for phrase matching. */
+	normalized: string;
+	/** Tokenized terms, built lazily only for candidate messages. */
+	terms?: Set<string>;
+}
+
+/** A transcript file on disk. */
+export interface SessionFile {
+	path: string;
+	root: string;
+	relPath: string;
+	/** Project the session ran in: the recorded cwd, or a decode of the folder name. */
+	project: string;
+	/** Short display name for the project (basename of the cwd). */
+	projectName: string;
+	/** Session start, from the file name or the header. */
+	startedAt: number;
+	mtimeMs: number;
+	size: number;
+}
+
+export interface SessionSearchOptions {
+	limit?: number;
+	/** Only sessions started within the last N days. */
+	sinceDays?: number;
+	/** Substring match on the project path or folder name. */
+	project?: string;
+	/** Include tool calls, tool results, custom payloads and compaction summaries. */
+	includeTools?: boolean;
+	/** Only user messages. */
+	userOnly?: boolean;
+	/** Wall-clock budget; stops scanning (newest first) and reports `partial`. */
+	budgetMs?: number;
+	/** Excerpt size override. */
+	excerptChars?: number;
+}
+
+export interface SessionHit {
+	path: string;
+	relPath: string;
+	project: string;
+	projectName: string;
+	line: number;
+	role: SessionMessage["role"];
+	timestamp: number;
+	score: number;
+	matched: string[];
+	exact: boolean;
+	excerpt: string;
+}
+
+export interface SessionScanStats {
+	roots: string[];
+	files: number;
+	messages: number;
+	bytes: number;
+	/** Files served from the parsed-message cache. */
+	cachedFiles: number;
+	/** Unreadable files or lines that could not be parsed. */
+	skipped: number;
+	/** True when the budget stopped the scan before every file was read. */
+	partial: boolean;
+}
+
+export interface SessionSearchResult {
+	hits: SessionHit[];
+	stats: SessionScanStats;
+	tookMs: number;
+}
+
+export interface SessionWindowMessage {
+	line: number;
+	role: string;
+	timestamp: number;
+	text: string;
+}
+
+export interface SessionReadResult {
+	path: string;
+	relPath: string;
+	projectName: string;
+	startLine: number;
+	endLine: number;
+	messages: SessionWindowMessage[];
 }
