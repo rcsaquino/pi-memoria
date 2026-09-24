@@ -1,4 +1,4 @@
-# memoria
+# pi-memoria
 
 Agent-first long-term memory for [pi](https://github.com/badlogic/pi-mono).
 
