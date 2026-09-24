@@ -1,0 +1,71 @@
+{
+	"name": "pi-memoria",
+	"version": "0.1.0",
+	"description": "Agent-first long-term memory for pi: a categorized markdown library with automatic, sub-millisecond recall.",
+	"type": "module",
+	"license": "MIT",
+	"author": "rcsaquino",
+	"homepage": "https://github.com/rcsaquino/pi-memoria#readme",
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/rcsaquino/pi-memoria.git"
+	},
+	"bugs": {
+		"url": "https://github.com/rcsaquino/pi-memoria/issues"
+	},
+	"keywords": [
+		"pi-package",
+		"pi-extension",
+		"memory",
+		"recall",
+		"markdown"
+	],
+	"engines": {
+		"node": ">=22.19.0"
+	},
+	"pi": {
+		"extensions": [
+			"./index.ts"
+		],
+		"skills": [
+			"./skills"
+		]
+	},
+	"files": [
+		"index.ts",
+		"src",
+		"skills",
+		"README.md",
+		"LICENSE"
+	],
+	"scripts": {
+		"test": "node --test tests/*.test.ts",
+		"eval": "node tests/eval.ts",
+		"bench": "node tests/bench.ts",
+		"bench:real": "node tests/bench.ts 1000 5000 --real",
+		"typecheck": "tsc --noEmit"
+	},
+	"peerDependencies": {
+		"@earendil-works/pi-coding-agent": "*",
+		"@earendil-works/pi-tui": "*",
+		"typebox": "*"
+	},
+	"devDependencies": {
+		"@earendil-works/pi-coding-agent": "*",
+		"@earendil-works/pi-tui": "*",
+		"@types/node": "^24.0.0",
+		"typebox": "*",
+		"typescript": "^5.6.0"
+	},
+	"peerDependenciesMeta": {
+		"@earendil-works/pi-coding-agent": {
+			"optional": true
+		},
+		"@earendil-works/pi-tui": {
+			"optional": true
+		},
+		"typebox": {
+			"optional": true
+		}
+	}
+}

@@ -1,0 +1,8 @@
+node_modules/
+# A legacy project-local store at the repo root only; skills/memoria is tracked.
+/memoria/
+.pi/
+.scratch/
+package-lock.json
+*.log
+.DS_Store
