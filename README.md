@@ -409,6 +409,7 @@ back to the default rather than failing.
 | `sessionExcerptChars` | `400` | Context characters per transcript hit. |
 | `sessionCacheBytes` | `33554432` | In-memory budget for parsed transcripts. |
 | `sessionIncludeTools` | `false` | Include tool calls/results and compaction summaries by default. |
+| `sessionRipgrep` | `true` | Use a ripgrep prefilter to skip match-free transcripts when `rg` is available; without it the slower built-in scanner runs. |
 
 ## Scopes: personal, project, read-only
 
@@ -495,13 +496,29 @@ What it does and does not touch:
 | Content | User and assistant **text** by default. Thinking blocks are never extracted. Tool calls/results, compaction summaries and extension payloads only with `include_tools: true`. |
 | Output | Bounded excerpts plus `file:line`; never a whole transcript dump. |
 | Writes | None. Transcripts are read-only and `read` refuses paths outside the session roots. |
-| Cost | Full cold scan of 110 sessions / 13 MB ≈ 120 ms; repeat searches ≈ 5 ms from the parse cache. |
-| Coverage | Exhaustive unless a budget stops it. `partial` (shown in the tool output, the recall block and `/memoria sessions`) means the scan stopped early: the hits are real, but older sessions were not read. Newest sessions are scanned first, already-parsed files stay cached (so each retry gets further), and an explicit `memoria_sessions` call uses the larger `sessionScanMs` budget. |
+| Cost | With `rg`, only transcripts containing the query terms are parsed; without it, a full cold scan of 110 sessions / 13 MB ≈ 120 ms, repeats ≈ 5 ms from the parse cache. |
+| Coverage | Exhaustive unless a budget stops it. `partial` (shown in the tool output, the recall block and `/memoria sessions`) means the scan stopped early: the hits are real, but older sessions were not read. Newest sessions are scanned first, already-parsed files stay cached while they fit `sessionCacheBytes` (so retries get further on corpora that fit the cache), and concurrent searches share one in-flight parse per transcript (so several `memoria_sessions` calls in one turn do not multiply the work). An explicit `memoria_sessions` call uses the larger `sessionScanMs` budget. |
 | Privacy | Nothing leaves the machine; the excerpts go to the model only when the feature runs. |
 
 `sessionRoots` exists for archives or a second agent directory. Set
 `sessionSearch: false` to disable the feature entirely, or
 `sessionFallback: false` to keep the tool while never searching automatically.
+
+When `rg` is available (pi ships it and puts it on `PATH`), a selective search
+asks ripgrep which transcripts contain the query terms and parses only those, so
+even a gigabyte-scale history is answered within the normal budget. If `rg` is
+missing or fails, memoria falls back to reading every transcript itself and says
+so: the result carries a `ripgrep is not installed` note, and interactive mode
+shows it once per session. Large histories may then be only partially covered.
+
+Without `rg` (or for a deliberately disabled accelerator), the default
+`sessionScanMs` budget and `sessionCacheBytes` cache cover only part of a large
+corpus: searches report `partial`, and repeats are cold scans because the cache
+cannot retain the parsed files. Raise `sessionScanMs` so an explicit
+`memoria_sessions` call can cover the whole corpus in one pass, and
+`sessionCacheBytes` only if you have the RAM for the parsed messages (at this
+scale that means gigabytes). The automatic fallback remains capped at 400 ms,
+so on such a corpus it is always a partial scan.
 
 ## Backup and migration
 

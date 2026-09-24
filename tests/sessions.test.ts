@@ -10,9 +10,9 @@ import { existsSync } from "node:fs";
 import { mkdir, mkdtemp, rm, symlink, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { SessionStore, buildExcerpt, extractMessageText, findPhrase, normalizeForSessionMatch } from "../src/sessions.ts";
+import { SessionStore, buildExcerpt, extractMessageText, findPhrase, normalizeForSessionMatch, ripgrepNeedles } from "../src/sessions.ts";
 import { MemoriaRuntime } from "../src/runtime.ts";
-import { renderRecallBlock, renderSystemSection, renderSessionFallback } from "../src/recall.ts";
+import { renderRecallBlock, renderSystemSection, renderSessionFallback, ripgrepNotice } from "../src/recall.ts";
 import { registerMemoriaTools } from "../src/tools.ts";
 
 interface FakeEntry {
@@ -61,15 +61,91 @@ async function writeSession(
 
 async function withSessions(
 	fn: (context: { root: string; store: SessionStore }) => Promise<void>,
-	options: { cacheBytes?: number } = {},
+	// Tests disable the ripgrep accelerator by default so results never depend on
+	// whether the machine running them has `rg`; the accelerator gets its own tests.
+	options: { cacheBytes?: number; rgPath?: string | null } = {},
 ): Promise<void> {
 	const root = await mkdtemp(join(tmpdir(), "memoria-sessions-"));
 	try {
-		const store = new SessionStore({ roots: [root], cacheBytes: options.cacheBytes ?? 8 * 1024 * 1024, excerptChars: 200 });
+		const store = new SessionStore({ roots: [root], cacheBytes: options.cacheBytes ?? 8 * 1024 * 1024, excerptChars: 200, rgPath: options.rgPath === undefined ? null : options.rgPath });
 		await fn({ root, store });
 	} finally {
 		await rm(root, { recursive: true, force: true });
 	}
+}
+
+/**
+ * A stand-in for `rg --files-with-matches -i -F`: walks the roots, prints the
+ * JSONL files whose text contains at least one `-e` needle, and exits 1 when
+ * there are none. Written into the temp root so the prompt never depends on a
+ * real ripgrep being installed.
+ */
+const FAKE_RG_MATCH = `#!/usr/bin/env node
+import { readdir, readFile } from "node:fs/promises";
+import { join } from "node:path";
+const args = process.argv.slice(2);
+const needles = [];
+const roots = [];
+let afterDash = false;
+for (let i = 0; i < args.length; i += 1) {
+	const arg = args[i];
+	if (!afterDash && arg === "--") { afterDash = true; continue; }
+	if (!afterDash && arg === "-e") { needles.push(args[++i]); continue; }
+	if (!afterDash && (arg === "--iglob" || arg === "--glob")) { i += 1; continue; }
+	if (!afterDash && arg.startsWith("-")) continue;
+	roots.push(arg);
+}
+const found = [];
+async function walk(dir, depth) {
+	if (depth > 4) return;
+	let entries;
+	try { entries = await readdir(dir, { withFileTypes: true }); } catch { return; }
+	for (const entry of entries) {
+		if (entry.isSymbolicLink()) continue;
+		const path = join(dir, entry.name);
+		if (entry.isDirectory()) { if (!entry.name.startsWith(".")) await walk(path, depth + 1); continue; }
+		if (!entry.isFile() || !entry.name.endsWith(".jsonl")) continue;
+		let text;
+		try { text = (await readFile(path, "utf8")).toLowerCase(); } catch { continue; }
+		if (needles.some((needle) => text.includes(needle))) found.push(path);
+	}
+}
+for (const root of roots) await walk(root, 0);
+if (found.length === 0) process.exit(1);
+process.stdout.write(found.join("\\n") + "\\n");
+`;
+
+/** Write an executable fake `rg` into `dir` with the given script body. */
+async function writeFakeRg(dir: string, body: string, name = "fake-rg.mjs"): Promise<string> {
+	const path = join(dir, name);
+	await writeFile(path, body, { mode: 0o755 });
+	return path;
+}
+
+/** Run `fn` with a fake ripgrep binary, or with `null` (accelerator disabled). */
+async function withFakeRipgrep(body: string | null, fn: (rgPath: string | null) => Promise<void>): Promise<void> {
+	const dir = await mkdtemp(join(tmpdir(), "memoria-fake-rg-"));
+	try {
+		await fn(body === null ? null : await writeFakeRg(dir, body));
+	} finally {
+		await rm(dir, { recursive: true, force: true });
+	}
+}
+
+/**
+ * Count real transcript parses by wrapping the store's internal `parseFile`.
+ * The behaviour under test is that concurrent searches *join* an in-flight
+ * parse instead of each starting a duplicate read and `JSON.parse`.
+ */
+function watchParses(store: SessionStore): { count: () => number; reset: () => void } {
+	let parses = 0;
+	const spied = store as unknown as { parseFile: (...args: Parameters<SessionStore["messagesFor"]>) => Promise<unknown> };
+	const original = spied.parseFile.bind(store);
+	spied.parseFile = (...args) => {
+		parses += 1;
+		return original(...args);
+	};
+	return { count: () => parses, reset: () => { parses = 0; } };
 }
 
 /* ------------------------------------------------------------------ */
@@ -264,6 +340,174 @@ test("parsed transcripts are cached and re-read when the file changes", async ()
 	});
 });
 
+test("concurrent searches share one in-flight parse per transcript", async () => {
+	await withSessions(async ({ root, store }) => {
+		for (let i = 0; i < 3; i += 1) {
+			await writeSession(root, `--home-me-par${i}--`, `2026-03-0${i + 1}T10-00-00-000Z_s${i}`, [{ role: "user", text: `pineapple parallel note ${i}` }]);
+		}
+		const parses = watchParses(store);
+		const results = await Promise.all([
+			store.search("pineapple", { limit: 5, budgetMs: 10_000 }),
+			store.search("pineapple", { limit: 5, budgetMs: 10_000 }),
+			store.search("pineapple", { limit: 5, budgetMs: 10_000 }),
+		]);
+		assert.equal(parses.count(), 3, "one parse per transcript, not one per search");
+		for (const result of results) {
+			assert.equal(result.stats.files, 3);
+			assert.equal(result.stats.partial, false);
+			assert.equal(result.hits.length, 3);
+		}
+	});
+});
+
+test("a default-view request joins an in-flight full parse, never the reverse", async () => {
+	await withSessions(async ({ root, store }) => {
+		await writeSession(root, "--home-me-variant--", "2026-04-01T10-00-00-000Z_v", [
+			{ role: "user", text: "pineapple question" },
+			{ role: "assistant", text: "pineapple answer", tool: { name: "bash", arguments: { command: "echo pineapple" } } },
+			{ role: "toolResult", text: "pineapple tool output" },
+		]);
+		const { files } = await store.listFiles();
+		assert.equal(files.length, 1);
+		const parses = watchParses(store);
+		const [full, core] = await Promise.all([store.messagesFor(files[0], true), store.messagesFor(files[0], false)]);
+		assert.equal(parses.count(), 1, "the default view joined the full parse");
+		assert.ok(full.messages.some((message) => message.role === "tool"));
+		assert.equal(core.messages.some((message) => message.role === "tool"), false);
+		// The other direction is forbidden: a core parse never extracted tool text.
+		store.clear();
+		parses.reset();
+		const [coreFirst, fullSecond] = await Promise.all([store.messagesFor(files[0], false), store.messagesFor(files[0], true)]);
+		assert.equal(parses.count(), 2, "a full request never reuses a core parse");
+		assert.equal(coreFirst.messages.some((message) => message.role === "tool"), false);
+		assert.ok(fullSecond.messages.some((message) => message.role === "tool"));
+	});
+});
+
+test("a cache hit touches the entry's real key, not a duplicate", async () => {
+	await withSessions(async ({ root, store }) => {
+		await writeSession(root, "--home-me-lru--", "2026-05-01T10-00-00-000Z_l", [{ role: "user", text: "pineapple lru" }]);
+		const full = await store.search("pineapple", { limit: 5, budgetMs: 10_000, includeTools: true });
+		assert.equal(full.stats.cachedFiles, 0);
+		assert.equal(store.cachedFileCount, 1);
+		const core = await store.search("pineapple", { limit: 5, budgetMs: 10_000 });
+		assert.equal(core.stats.cachedFiles, 1, "the default view is served from the full parse");
+		assert.equal(store.cachedFileCount, 1, "the hit must not fork the entry into a second key");
+	});
+});
+
+/* ------------------------------------------------------------------ */
+/* Ripgrep candidate prefilter                                         */
+/* ------------------------------------------------------------------ */
+
+test("ripgrep needles cover terms, phrases and the ies/y stem rule", () => {
+	assert.deepEqual(ripgrepNeedles([], ["de", "guzman"]), ["de", "guzman"]);
+	// "parties" stems to "party", which is not a substring of the surface form.
+	assert.deepEqual(ripgrepNeedles([], ["party"]), ["party", "parties"]);
+	assert.deepEqual(ripgrepNeedles([], ["組織"]), ["組織"]);
+	// A phrase needs one selective witness, not every word: "out" and "of"
+	// would otherwise match almost every transcript.
+	assert.deepEqual(ripgrepNeedles(["out of office"], []), ["office"]);
+	assert.deepEqual(ripgrepNeedles(["guzman a"], ["guzman"]), ["guzman"]);
+	// With no long word, a short one is the only witness available.
+	assert.deepEqual(ripgrepNeedles(["go up"], []), ["go"]);
+	// Accented words disable the prefilter instead of risking a normalization mismatch.
+	assert.equal(ripgrepNeedles([], ["café"]), undefined);
+	assert.equal(ripgrepNeedles(["café crème"], []), undefined);
+	assert.equal(ripgrepNeedles([], []), undefined);
+});
+
+test("ripgrep narrows parsing to matching transcripts without losing hits", async () => {
+	await withFakeRipgrep(FAKE_RG_MATCH, async (rgPath) => {
+		await withSessions(
+			async ({ root, store }) => {
+				await writeSession(root, "--home-me-rg--", "2026-06-01T10-00-00-000Z_a", [{ role: "user", text: "pineapple decision" }]);
+				await writeSession(root, "--home-me-rg--", "2026-06-02T10-00-00-000Z_b", [{ role: "user", text: "mango smoothie" }]);
+				await writeSession(root, "--home-me-rg--", "2026-06-03T10-00-00-000Z_c", [{ role: "user", text: "pineapple cake" }]);
+				const parses = watchParses(store);
+				const result = await store.search("pineapple", { limit: 10, budgetMs: 10_000 });
+				assert.equal(result.stats.ripgrep, "used");
+				assert.equal(result.stats.files, 3, "non-matching transcripts still count as scanned");
+				assert.equal(result.stats.partial, false);
+				assert.equal(result.hits.length, 2);
+				assert.equal(parses.count(), 2, "only the matching transcripts are parsed");
+				// A term nobody used is answered with full coverage and no parses.
+				parses.reset();
+				const none = await store.search("kiwi", { limit: 10, budgetMs: 10_000 });
+				assert.equal(none.stats.ripgrep, "used");
+				assert.equal(none.stats.files, 3);
+				assert.equal(none.hits.length, 0);
+				assert.equal(parses.count(), 0);
+			},
+			{ rgPath },
+		);
+	});
+});
+
+test("ripgrep finds stemmed surface forms such as parties for party", async () => {
+	await withFakeRipgrep(FAKE_RG_MATCH, async (rgPath) => {
+		await withSessions(
+			async ({ root, store }) => {
+				await writeSession(root, "--home-me-rg--", "2026-06-01T10-00-00-000Z_a", [{ role: "user", text: "the company parties were long" }]);
+				const result = await store.search("party", { limit: 5, budgetMs: 10_000 });
+				assert.equal(result.stats.ripgrep, "used");
+				assert.equal(result.hits.length, 1);
+			},
+			{ rgPath },
+		);
+	});
+});
+
+test("a missing or failing ripgrep falls back to the full scan and reports it", async () => {
+	await withSessions(
+		async ({ root, store }) => {
+			await writeSession(root, "--home-me-rg--", "2026-06-01T10-00-00-000Z_a", [{ role: "user", text: "pineapple decision" }]);
+			const result = await store.search("pineapple", { limit: 5, budgetMs: 10_000 });
+			assert.equal(result.stats.ripgrep, "missing");
+			assert.equal(result.hits.length, 1);
+		},
+		{ rgPath: join(tmpdir(), "memoria-rg-not-installed", "rg") },
+	);
+
+	await withFakeRipgrep("#!/usr/bin/env node\nprocess.exit(2);\n", async (rgPath) => {
+		await withSessions(
+			async ({ root, store }) => {
+				await writeSession(root, "--home-me-rg--", "2026-06-01T10-00-00-000Z_a", [{ role: "user", text: "pineapple decision" }]);
+				const result = await store.search("pineapple", { limit: 5, budgetMs: 10_000 });
+				assert.equal(result.stats.ripgrep, "error");
+				assert.equal(result.hits.length, 1);
+			},
+			{ rgPath },
+		);
+	});
+
+	await withSessions(
+		async ({ root, store }) => {
+			await writeSession(root, "--home-me-rg--", "2026-06-01T10-00-00-000Z_a", [{ role: "user", text: "pineapple decision" }]);
+			const result = await store.search("pineapple", { limit: 5, budgetMs: 10_000 });
+			assert.equal(result.stats.ripgrep, "disabled");
+			assert.equal(result.hits.length, 1);
+		},
+		{ rgPath: null },
+	);
+});
+
+test("a query that cannot be prefilted safely is still searched in full", async () => {
+	await withFakeRipgrep(FAKE_RG_MATCH, async (rgPath) => {
+		await withSessions(
+			async ({ root, store }) => {
+				await writeSession(root, "--home-me-rg--", "2026-06-01T10-00-00-000Z_a", [{ role: "user", text: "café crème at the office" }]);
+				const parses = watchParses(store);
+				const result = await store.search("café crème", { limit: 5, budgetMs: 10_000 });
+				assert.equal(result.stats.ripgrep, "unsupported");
+				assert.equal(result.hits.length, 1);
+				assert.equal(parses.count(), 1);
+			},
+			{ rgPath },
+		);
+	});
+});
+
 test("readWindow returns surrounding dialogue and refuses unsafe paths", async () => {
 	await withSessions(async ({ root, store }) => {
 		const path = await writeSession(root, "--home-me-window--", "2026-01-01T10-00-00-000Z_a", [
@@ -314,6 +558,16 @@ async function withAgentDir(fn: (context: { runtime: MemoriaRuntime; agentDir: s
 		await rm(home, { recursive: true, force: true });
 	}
 }
+
+test("the runtime can turn the ripgrep accelerator off", async () => {
+	await withAgentDir(async ({ runtime, sessions }) => {
+		await writeSession(sessions, "--home-me-off--", "2026-06-01T10-00-00-000Z_a", [{ role: "user", text: "pineapple off" }]);
+		await runtime.reconfigure({ ...runtime.config, sessionRipgrep: false });
+		const result = await runtime.sessionSearch("pineapple", { limit: 5, budgetMs: 10_000 });
+		assert.equal(result.stats.ripgrep, "disabled");
+		assert.equal(result.hits.length, 1);
+	});
+});
 
 test("the runtime searches real session roots and falls back only on an empty library", async () => {
 	await withAgentDir(async ({ runtime, sessions }) => {
@@ -391,6 +645,14 @@ test("the recall renderers label session evidence and keep it separate", async (
 	assert.ok(fallback.includes("memoria_sessions"));
 	assert.ok(fallback.includes(":12"), fallback);
 
+	// A missing accelerator is called out; deliberate or inapplicable fallbacks are not.
+	const missingRg = renderSessionFallback(hits, { files: 3, messages: 20, partial: false, ripgrep: "missing" });
+	assert.ok(missingRg.includes("ripgrep is not installed"), missingRg);
+	assert.equal(ripgrepNotice("used"), undefined);
+	assert.equal(ripgrepNotice("disabled"), undefined);
+	assert.equal(ripgrepNotice("unsupported"), undefined);
+	assert.ok((ripgrepNotice("error") ?? "").includes("ripgrep failed"));
+
 	const block = renderRecallBlock({ query: "deploy window", hits: [], maxChars: 1200, tookMs: 4, sessionHits: hits, sessionStats: { files: 3, messages: 20, partial: false } });
 	assert.ok(block.startsWith("<memoria_recall"));
 	assert.ok(block.includes("past") || block.includes("earlier conversations"), block);
@@ -418,6 +680,10 @@ test("the memoria_sessions tool searches and reads transcripts", async () => {
 	} as never;
 	registerMemoriaTools(pi, async () => runtime);
 	const ctx = { cwd } as never;
+	// Force the no-ripgrep fallback (the temp agent dir has no `bin/rg` and PATH is
+	// empty) so the missing-accelerator notice is covered end to end.
+	const originalPath = process.env.PATH;
+	process.env.PATH = "";
 	try {
 		await runtime.init(true);
 		const sessionsTool = tools.get("memoria_sessions")!;
@@ -426,6 +692,7 @@ test("the memoria_sessions tool searches and reads transcripts", async () => {
 		const searchText = String(search.content[0].text);
 		assert.ok(searchText.includes("pineapple release process"), searchText);
 		assert.ok(searchText.includes("file:"), searchText);
+		assert.ok(searchText.includes("ripgrep is not installed"), searchText);
 		const read = await sessionsTool.execute("s2", { action: "read", path: join(sessions, "--home-me-tool--", "2026-01-01T10-00-00-000Z_a.jsonl"), line: 2, window: 2 }, undefined, undefined, ctx);
 		const readText = String(read.content[0].text);
 		assert.ok(readText.includes("pineapple release process"));
@@ -437,6 +704,7 @@ test("the memoria_sessions tool searches and reads transcripts", async () => {
 			return value;
 		}));
 	} finally {
+		process.env.PATH = originalPath;
 		await runtime.dispose();
 		await rm(cwd, { recursive: true, force: true });
 		await rm(home, { recursive: true, force: true });

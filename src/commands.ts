@@ -13,6 +13,7 @@ import { Markdown, Text } from "@earendil-works/pi-tui";
 import type { MemoriaRuntime } from "./runtime.ts";
 import type { RuntimeGetter } from "./tools.ts";
 import { harvestSession } from "./learn.ts";
+import { ripgrepNotice } from "./recall.ts";
 import { formatSessionTime } from "./sessions.ts";
 import { describeAge } from "./usage.ts";
 import { atomicWriteFile, oneLine } from "./util.ts";
@@ -318,11 +319,12 @@ export function registerMemoriaCommand(pi: ExtensionAPI, getRuntime: RuntimeGett
 					});
 					const stats = result.stats;
 					const header = `${result.hits.length} match${result.hits.length === 1 ? "" : "es"} in ${stats.files} sessions / ${stats.messages} messages (${result.tookMs}ms${stats.partial ? ", partial scan" : ""}${stats.skipped > 0 ? `, ${stats.skipped} unreadable records skipped` : ""}).`;
+					const notice = ripgrepNotice(stats.ripgrep);
 					if (result.hits.length === 0) {
-						emit(pi, `memoria sessions: ${oneLine(query, 60)}`, `${header}\n\nNo saved conversation matched. Try other wording, a name or a date.`);
+						emit(pi, `memoria sessions: ${oneLine(query, 60)}`, `${header}${notice ? `\n\n_Note: ${notice}._` : ""}\n\nNo saved conversation matched. Try other wording, a name or a date.`);
 						return;
 					}
-					const lines = [header, "", "_Evidence from raw transcripts, not curated memory._", ""];
+					const lines = [header, ...(notice ? [`_Note: ${notice}._`] : []), "", "_Evidence from raw transcripts, not curated memory._", ""];
 					for (const hit of result.hits) {
 						lines.push(`- **[${hit.role}] ${formatSessionTime(hit.timestamp)}** · ${hit.projectName} · score ${hit.score}${hit.exact ? " · exact" : ""}`);
 						lines.push(`  ${oneLine(hit.excerpt, 400)}`);

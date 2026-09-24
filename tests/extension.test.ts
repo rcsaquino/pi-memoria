@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -220,6 +220,39 @@ test("auto-recall stays silent when nothing is relevant", async () => {
 		assert.ok(event.systemPromptOptions.sections.memoria.length > 0, "system section is always injected");
 		assert.equal(results[0]?.message, undefined);
 	});
+});
+
+test("auto-recall warns once when ripgrep is missing", async () => {
+	// An empty PATH plus the temp agent dir (no bin/rg) forces the fallback
+	// scanner, so the user is told once why the scan may be slow.
+	const originalPath = process.env.PATH;
+	process.env.PATH = "";
+	try {
+		await withHarness(async (harness) => {
+			await harness.emit("session_start", { type: "session_start", reason: "startup" }, harness.ctx);
+			const agentDir = process.env.PI_CODING_AGENT_DIR!;
+			const dir = join(agentDir, "sessions", "--home-me-rg--");
+			await mkdir(dir, { recursive: true });
+			await writeFile(
+				join(dir, "2026-01-01T10-00-00-000Z_a.jsonl"),
+				`${JSON.stringify({ type: "session", version: 3, id: "a", timestamp: "2026-01-01T10:00:00.000Z", cwd: "/home/me/rg" })}\n${JSON.stringify({ type: "message", timestamp: "2026-01-01T10:00:01.000Z", message: { role: "user", content: [{ type: "text", text: "the zebra migration is scheduled" }] } })}\n`,
+				"utf8",
+			);
+			const event = {
+				type: "before_agent_start",
+				prompt: "when is the zebra migration",
+				systemPrompt: "base",
+				systemPromptOptions: { sections: {} as Record<string, string>, selectedTools: [], toolSnippets: {}, toolGuidelines: {}, promptGuidelines: [], appendSystemPrompt: "", contextFiles: [], skills: [] },
+			};
+			const first = await harness.emit("before_agent_start", event, harness.ctx);
+			assert.ok(first[0]?.message?.content.includes("zebra"), JSON.stringify(first[0]?.message?.content));
+			await harness.emit("before_agent_start", event, harness.ctx);
+			const warnings = harness.notifications.filter((message) => message.includes("ripgrep"));
+			assert.equal(warnings.length, 1, harness.notifications.join(" | "));
+		});
+	} finally {
+		process.env.PATH = originalPath;
+	}
 });
 
 test("slash-command prompts skip auto-recall", async () => {

@@ -430,6 +430,8 @@ export interface MemoriaConfig {
 	sessionCacheBytes: number;
 	/** Include tool calls, tool results and compaction summaries by default. */
 	sessionIncludeTools: boolean;
+	/** Use a ripgrep prefilter to skip match-free transcripts when `rg` exists. */
+	sessionRipgrep: boolean;
 }
 
 /* ------------------------------------------------------------------ */
@@ -497,6 +499,18 @@ export interface SessionHit {
 	excerpt: string;
 }
 
+/**
+ * How the ripgrep candidate prefilter contributed to a transcript scan.
+ *
+ * `used` means ripgrep listed the files containing at least one query needle
+ * and the rest were skipped without parsing. The others are fallbacks so the
+ * search still works without a usable `rg`:
+ * `missing` (no binary), `error` (spawn failure/timeout/bad exit),
+ * `disabled` (config), `unsupported` (query cannot be prefiltered safely),
+ * `skipped` (no budget left to try).
+ */
+export type SessionRipgrepStatus = "used" | "missing" | "error" | "disabled" | "unsupported" | "skipped";
+
 export interface SessionScanStats {
 	roots: string[];
 	files: number;
@@ -508,6 +522,8 @@ export interface SessionScanStats {
 	skipped: number;
 	/** True when the budget stopped the scan before every file was read. */
 	partial: boolean;
+	/** Ripgrep prefilter outcome, when a scan ran. */
+	ripgrep?: SessionRipgrepStatus;
 }
 
 export interface SessionSearchResult {

@@ -23,15 +23,20 @@
  *    paths outside the configured roots.
  */
 
-import { existsSync } from "node:fs";
+import { spawn } from "node:child_process";
+import { accessSync, constants, existsSync } from "node:fs";
 import { readdir, readFile, stat } from "node:fs/promises";
-import { basename, join, relative, resolve, sep } from "node:path";
+import { basename, delimiter, join, relative, resolve, sep } from "node:path";
 import { isCjkChar, stem, tokenize } from "./tokenize.ts";
 import { oneLine, truncateChars } from "./util.ts";
 import type { SessionFile, SessionHit, SessionMessage, SessionReadResult, SessionScanStats, SessionSearchOptions, SessionSearchResult, SessionWindowMessage } from "./types.ts";
 
 /** Hard cap on a single extracted message, to keep the cache useful. */
 export const MAX_SESSION_MESSAGE_CHARS = 4000;
+/** Upper bound on ripgrep's file list, so a pathological match set cannot exhaust memory. */
+const MAX_RG_OUTPUT_CHARS = 16 * 1024 * 1024;
+/** ripgrep is killed after this long, even when the search itself has no budget. */
+const MAX_RG_TIMEOUT_MS = 10_000;
 /** Directories deeper than this under a root are ignored. */
 const MAX_WALK_DEPTH = 4;
 /** Files larger than this are skipped rather than read into memory. */
@@ -182,6 +187,53 @@ function cacheKey(path: string, includeTools: boolean): string {
 	return `${path}::${includeTools ? "all" : "core"}`;
 }
 
+/** Characters a ripgrep needle may contain: ASCII alphanumerics, `_` and CJK. */
+function needleSafe(word: string): boolean {
+	if (!word) return false;
+	for (const ch of word) {
+		if (/[a-z0-9_]/.test(ch) || isCjkChar(ch)) continue;
+		return false;
+	}
+	return true;
+}
+
+/**
+ * Fixed-string needles for the ripgrep prefilter, or `undefined` when the query
+ * cannot be proven to be covered by them.
+ *
+ * A file is skipped only when ripgrep finds none of these strings, so they must
+ * cover everything the scorer can match: every scoring term (`tokenize` already
+ * lowercases) and — because a phrase match implies all of its words — the
+ * longest safe word of each exact phrase. Terms ending in `y` also probe the
+ * `…ies` surface form: that is the one stemmer rule which is not
+ * prefix-preserving, so query "party" must also match "parties". Non-ASCII,
+ * non-CJK words disable the prefilter rather than risk a normalization
+ * mismatch.
+ */
+export function ripgrepNeedles(phrases: string[], terms: string[]): string[] | undefined {
+	const needles = new Set<string>();
+	const add = (word: string): void => {
+		const normalized = word.toLowerCase();
+		if (!needleSafe(normalized)) return;
+		needles.add(normalized);
+		if (normalized.length >= 4 && normalized.endsWith("y")) needles.add(`${normalized.slice(0, -1)}ies`);
+	};
+	for (const term of terms) {
+		if (!needleSafe(term.toLowerCase())) return undefined;
+		add(term);
+	}
+	for (const phrase of phrases) {
+		// One word of a phrase is enough to witness it: a phrase match implies
+		// every word is present. The longest safe word is the most selective, and
+		// a short but common witness ("a", "out") would match nearly everything.
+		const words = phrase.split(" ").filter((word) => needleSafe(word.toLowerCase()));
+		if (words.length === 0) return undefined;
+		add(words.reduce((best, word) => (word.length > best.length ? word : best)));
+	}
+	if (needles.size === 0 || needles.size > 64) return undefined;
+	return [...needles];
+}
+
 export interface SessionStoreOptions {
 	/** Transcript roots to scan, in priority order. */
 	roots: string[];
@@ -189,6 +241,14 @@ export interface SessionStoreOptions {
 	cacheBytes?: number;
 	/** Default excerpt size. */
 	excerptChars?: number;
+	/**
+	 * Ripgrep binary used to find candidate transcripts before parsing. `null`
+	 * disables the accelerator, a path uses exactly that binary, and `undefined`
+	 * auto-detects from `rgCandidates` and then `PATH`.
+	 */
+	rgPath?: string | null;
+	/** Locations checked before `PATH` when auto-detecting (e.g. pi's bin dir). */
+	rgCandidates?: string[];
 }
 
 interface CachedFile {
@@ -206,14 +266,114 @@ interface CachedFile {
 export class SessionStore {
 	readonly roots: string[];
 	private cache = new Map<string, CachedFile>();
+	/** In-flight parses, so concurrent searches share one read/parse per file. */
+	private inflight = new Map<string, Promise<{ entry: CachedFile | undefined; skipped: number; rawBytes: number }>>();
 	private cacheBytes = 0;
 	private cacheBudget: number;
 	private excerptChars: number;
+	private rgPathOption: string | null | undefined;
+	private rgCandidates: string[];
+	/** Resolved once per store: a path, `null` (unavailable/disabled), or unknown. */
+	private rgLocated: string | null | undefined;
 
 	constructor(options: SessionStoreOptions) {
 		this.roots = options.roots;
 		this.cacheBudget = Math.max(0, options.cacheBytes ?? 32 * 1024 * 1024);
 		this.excerptChars = Math.max(80, options.excerptChars ?? 400);
+		this.rgPathOption = options.rgPath;
+		this.rgCandidates = options.rgCandidates ?? [];
+	}
+
+	/** Resolve the ripgrep binary once; `null` means the accelerator is off. */
+	private locateRipgrep(): string | null {
+		if (this.rgLocated !== undefined) return this.rgLocated;
+		const candidates: string[] = [];
+		if (typeof this.rgPathOption === "string") {
+			candidates.push(this.rgPathOption);
+		} else if (this.rgPathOption === undefined) {
+			candidates.push(...this.rgCandidates);
+			for (const dir of (process.env.PATH ?? "").split(delimiter)) {
+				if (!dir) continue;
+				candidates.push(join(dir, process.platform === "win32" ? "rg.exe" : "rg"));
+			}
+		}
+		for (const candidate of candidates) {
+			try {
+				accessSync(candidate, constants.X_OK);
+				this.rgLocated = candidate;
+				return candidate;
+			} catch {
+				// Try the next location.
+			}
+		}
+		this.rgLocated = null;
+		return null;
+	}
+
+	/**
+	 * List the transcripts containing at least one needle with ripgrep.
+	 *
+	 * Returns matching paths, `"missing"` when no usable binary exists, or
+	 * `"error"` when ripgrep failed, timed out, or produced more output than the
+	 * caller can use. Both non-result outcomes make the caller fall back to the
+	 * full parse, so correctness never depends on the accelerator.
+	 */
+	private async ripgrepFiles(needles: string[], timeoutMs: number): Promise<Set<string> | "missing" | "error"> {
+		const binary = this.locateRipgrep();
+		if (!binary) return "missing";
+		const roots = this.roots.filter((root) => existsSync(root));
+		if (roots.length === 0) return new Set<string>();
+		const args = ["--files-with-matches", "--ignore-case", "--fixed-strings", "--no-messages", "--no-ignore", "--text", "--iglob", "*.jsonl"];
+		for (const needle of needles) args.push("-e", needle);
+		args.push("--", ...roots);
+		return await new Promise<Set<string> | "error">((settle) => {
+			let child;
+			try {
+				child = spawn(binary, args, { stdio: ["ignore", "pipe", "ignore"], windowsHide: true });
+			} catch {
+				settle("error");
+				return;
+			}
+			let out = "";
+			let settled = false;
+			let timer: ReturnType<typeof setTimeout> | undefined;
+			const finish = (value: Set<string> | "error"): void => {
+				if (settled) return;
+				settled = true;
+				if (timer) clearTimeout(timer);
+				settle(value);
+			};
+			const kill = (): void => {
+				try {
+					child.kill("SIGKILL");
+				} catch {
+					// Already gone.
+				}
+			};
+			timer = setTimeout(() => {
+				kill();
+				finish("error");
+			}, timeoutMs);
+			child.stdout?.setEncoding("utf8");
+			child.stdout?.on("data", (chunk: string) => {
+				out += chunk;
+				if (out.length > MAX_RG_OUTPUT_CHARS) {
+					kill();
+					finish("error");
+				}
+			});
+			child.on("error", () => finish("error"));
+			child.on("close", (code) => {
+				if (code === 1) return finish(new Set<string>());
+				if (code !== 0) return finish("error");
+				const paths = new Set<string>();
+				for (const line of out.split("\n")) {
+					const path = line.trim();
+					if (path) paths.add(resolve(path));
+				}
+				finish(paths);
+			});
+		});
 	}
 
 	/** True when at least one root exists on disk. */
@@ -296,26 +456,18 @@ export class SessionStore {
 		}
 	}
 
-	/** Parse a transcript, reusing the cache when mtime and size are unchanged. */
-	async messagesFor(file: SessionFile, includeTools: boolean): Promise<{ messages: SessionMessage[]; cached: boolean; skipped: number; rawBytes: number; cwd?: string }> {
-		const key = cacheKey(file.path, includeTools);
-		// A full parse can serve the default view, but the default view cannot
-		// serve an includeTools search (it never extracted the tool text).
-		const cached = includeTools
-			? this.cache.get(cacheKey(file.path, true))
-			: (this.cache.get(cacheKey(file.path, false)) ?? this.cache.get(cacheKey(file.path, true)));
-		if (cached && cached.mtimeMs === file.mtimeMs && cached.size === file.size) {
-			// Touch for LRU ordering.
-			this.cache.delete(key);
-			this.cache.set(key, cached);
-			const visible = includeTools ? cached.messages : cached.messages.filter((message) => message.role !== "tool" && message.role !== "summary");
-			return { messages: visible, cached: true, skipped: 0, rawBytes: cached.rawBytes, cwd: cached.header.cwd };
-		}
+	/** Default-view projection of a parsed file (tool plumbing hidden unless asked). */
+	private view(entry: CachedFile, includeTools: boolean): SessionMessage[] {
+		return includeTools ? entry.messages : entry.messages.filter((message) => message.role !== "tool" && message.role !== "summary");
+	}
+
+	/** Read and parse one transcript, populating the cache (no in-flight handling). */
+	private async parseFile(file: SessionFile, includeTools: boolean): Promise<{ entry: CachedFile | undefined; skipped: number; rawBytes: number }> {
 		let raw: string;
 		try {
 			raw = await readFile(file.path, "utf8");
 		} catch {
-			return { messages: [], cached: false, skipped: 1, rawBytes: 0 };
+			return { entry: undefined, skipped: 1, rawBytes: 0 };
 		}
 		const messages: SessionMessage[] = [];
 		let skipped = 0;
@@ -380,8 +532,51 @@ export class SessionStore {
 			header: { cwd, startedAt: headerStarted || file.startedAt },
 		};
 		this.put(parsed, includeTools);
-		const visible = includeTools ? messages : messages.filter((message) => message.role !== "tool" && message.role !== "summary");
-		return { messages: visible, cached: false, skipped, rawBytes: raw.length, cwd };
+		return { entry: parsed, skipped, rawBytes: raw.length };
+	}
+
+	/**
+	 * Parse a transcript, reusing the cache when mtime and size are unchanged.
+	 *
+	 * Concurrent searches (the common case, since one assistant turn can issue
+	 * several `memoria_sessions` calls at once) share a single in-flight parse
+	 * per file, so parallel searches never multiply read/parse work on one event
+	 * loop and never lose older files to another search's wall-clock budget.
+	 */
+	async messagesFor(file: SessionFile, includeTools: boolean): Promise<{ messages: SessionMessage[]; cached: boolean; skipped: number; rawBytes: number; cwd?: string }> {
+		const key = cacheKey(file.path, includeTools);
+		const allKey = cacheKey(file.path, true);
+		// A full parse can serve the default view, but the default view cannot
+		// serve an includeTools search (it never extracted the tool text).
+		const cached = includeTools ? this.cache.get(allKey) : (this.cache.get(cacheKey(file.path, false)) ?? this.cache.get(allKey));
+		if (cached && cached.mtimeMs === file.mtimeMs && cached.size === file.size) {
+			// Touch for LRU ordering, under the key the entry actually lives on.
+			for (const candidate of [key, allKey]) {
+				if (this.cache.get(candidate) === cached) {
+					this.cache.delete(candidate);
+					this.cache.set(candidate, cached);
+					break;
+				}
+			}
+			return { messages: this.view(cached, includeTools), cached: true, skipped: 0, rawBytes: cached.rawBytes, cwd: cached.header.cwd };
+		}
+		// Join an in-flight parse when it can answer this request: the same
+		// variant always, or a full parse for a default-view request.
+		const pending = this.inflight.get(key) ?? (includeTools ? undefined : this.inflight.get(allKey));
+		if (pending) {
+			const { entry, skipped, rawBytes } = await pending;
+			if (!entry) return { messages: [], cached: false, skipped, rawBytes };
+			return { messages: this.view(entry, includeTools), cached: false, skipped, rawBytes: entry.rawBytes, cwd: entry.header.cwd };
+		}
+		const promise = this.parseFile(file, includeTools);
+		this.inflight.set(key, promise);
+		try {
+			const { entry, skipped, rawBytes } = await promise;
+			if (!entry) return { messages: [], cached: false, skipped, rawBytes };
+			return { messages: this.view(entry, includeTools), cached: false, skipped, rawBytes: entry.rawBytes, cwd: entry.header.cwd };
+		} finally {
+			this.inflight.delete(key);
+		}
 	}
 
 	private put(entry: CachedFile, includeTools: boolean): void {
@@ -448,6 +643,38 @@ export class SessionStore {
 		// could not be completed is reported as partial.
 		const listing = await this.listFiles({ deadline: budgetMs > 0 ? started + budgetMs : undefined });
 		if (listing.truncated) stats.partial = true;
+
+		// Ripgrep narrows the parse set to files that contain at least one query
+		// needle. Files outside that set are provably match-free, so they count as
+		// scanned without being read. Without a usable binary (or a query we cannot
+		// prefilter safely) every listed file is parsed exactly as before.
+		let parseFilter: Set<string> | undefined;
+		if (this.rgPathOption === null) {
+			stats.ripgrep = "disabled";
+		} else {
+			const needles = ripgrepNeedles(phrases, scoringTerms);
+			if (!needles) {
+				stats.ripgrep = "unsupported";
+			} else {
+				const remaining = budgetMs > 0 ? started + budgetMs - performance.now() : Number.POSITIVE_INFINITY;
+				if (listing.files.length === 0 || remaining <= 0) {
+					stats.ripgrep = "skipped";
+				} else {
+					// The accelerator is fast, but give it a hard cap so a hung binary
+					// or a pathological mount cannot stall a prompt. Overrunning the
+					// remaining budget only makes the parse below report `partial`.
+					const timeout = Number.isFinite(remaining) ? Math.min(MAX_RG_TIMEOUT_MS, Math.max(500, Math.round(remaining * 4))) : MAX_RG_TIMEOUT_MS;
+					const found = await this.ripgrepFiles(needles, timeout);
+					if (found === "missing") stats.ripgrep = "missing";
+					else if (found === "error") stats.ripgrep = "error";
+					else {
+						parseFilter = found;
+						stats.ripgrep = "used";
+					}
+				}
+			}
+		}
+
 		const candidates: Candidate[] = [];
 		for (const file of listing.files) {
 			if (since !== undefined && file.startedAt < since) continue;
@@ -457,6 +684,11 @@ export class SessionStore {
 			if (budgetMs > 0 && performance.now() - started > budgetMs) {
 				stats.partial = true;
 				break;
+			}
+			if (parseFilter && !parseFilter.has(resolve(file.path))) {
+				stats.files += 1;
+				stats.bytes += file.size;
+				continue;
 			}
 			const parsed = await this.messagesFor(file, includeTools);
 			stats.files += 1;

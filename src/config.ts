@@ -74,6 +74,7 @@ export const DEFAULT_CONFIG: MemoriaConfig = {
 	sessionExcerptChars: 400,
 	sessionCacheBytes: 32 * 1024 * 1024,
 	sessionIncludeTools: false,
+	sessionRipgrep: true,
 };
 
 /** Filesystem context used to resolve store paths. */
@@ -168,6 +169,7 @@ function coerceConfig(raw: unknown): Partial<MemoriaConfig> {
 	if (number(input.sessionScanMs) !== undefined) out.sessionScanMs = Math.max(50, Math.min(60_000, number(input.sessionScanMs)!));
 	if (number(input.sessionExcerptChars) !== undefined) out.sessionExcerptChars = Math.max(80, Math.min(4000, number(input.sessionExcerptChars)!));
 	if (number(input.sessionCacheBytes) !== undefined) out.sessionCacheBytes = Math.max(0, number(input.sessionCacheBytes)!);
+	if (bool(input.sessionRipgrep) !== undefined) out.sessionRipgrep = bool(input.sessionRipgrep);
 	if (Array.isArray(input.sessionRoots)) out.sessionRoots = input.sessionRoots.filter((item): item is string => typeof item === "string");
 	if (input.synonyms && typeof input.synonyms === "object" && !Array.isArray(input.synonyms)) {
 		const table: Record<string, string[]> = {};

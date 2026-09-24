@@ -30,6 +30,9 @@ memoria_sessions { action: "search", query: "niri scale", include_tools: true, s
 - Every hit comes with a `file:` and `line:`, its role, project and score. If
   nothing matches, the result says how many sessions and messages were scanned —
   quote that when reporting, and try different wording before concluding.
+- If the result says ripgrep is not installed (or that a scan was `partial`),
+  the search used the slower built-in scanner and may not have reached the
+  oldest sessions. Say so when coverage matters, and prefer narrower queries.
 
 The extension also searches transcripts **automatically** when the memory
 library returns nothing and `sessionFallback` is on. That injection is a hint,

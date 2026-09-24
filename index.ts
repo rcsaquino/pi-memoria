@@ -25,7 +25,7 @@ import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import { MemoriaRuntime } from "./src/runtime.ts";
 import { registerMemoriaTools } from "./src/tools.ts";
 import { registerMemoriaCommand, setStatus } from "./src/commands.ts";
-import { RECALL_CUSTOM_TYPE, buildRecallParts, renderRecallBlock, renderStatusLine, renderSystemSection } from "./src/recall.ts";
+import { RECALL_CUSTOM_TYPE, buildRecallParts, renderRecallBlock, renderStatusLine, renderSystemSection, ripgrepNotice } from "./src/recall.ts";
 import { buildTranscriptText, harvestSession } from "./src/learn.ts";
 import { createModelReranker } from "./src/rerank.ts";
 import { tokenizeRaw } from "./src/tokenize.ts";
@@ -39,6 +39,8 @@ export default function memoria(pi: ExtensionAPI) {
 	let initPromise: Promise<void> | undefined;
 	let hotCache: { content: string; chars: number; limit: number; over: boolean; mtimeMs: number } | undefined;
 	let recentPrompts: string[] = [];
+	/** The missing-ripgrep warning is shown once per session, not on every prompt. */
+	let ripgrepWarned = false;
 	/** Auto-learn bookkeeping: user turns since the last extraction, and when. */
 	let turnsSinceLearn = 0;
 	let lastLearnAt = 0;
@@ -137,6 +139,11 @@ export default function memoria(pi: ExtensionAPI) {
 			if (tokens.length < 2 && !/\d/.test(prompt)) return undefined;
 			const parts = buildRecallParts(prompt, recentPrompts, memoria_.config.autoRecallLastTurns, memoria_.config.autoRecallPriorWeight);
 			const result = await memoria_.recall(oneLine(prompt, 400), { limit: memoria_.config.autoRecallLimit, scope: "all", parts });
+			const rgNotice = ripgrepNotice(result.sessionStats?.ripgrep);
+			if (rgNotice && !ripgrepWarned) {
+				ripgrepWarned = true;
+				ctx.ui.notify(`memoria: ${rgNotice}.`, "warning");
+			}
 			recentPrompts = [...recentPrompts, prompt].slice(-RECENT_PROMPT_LIMIT);
 			const hits = result.hits.filter((hit) => hit.score >= memoria_.config.autoRecallMinScore);
 			// Nothing in the library? Show what earlier conversations said instead

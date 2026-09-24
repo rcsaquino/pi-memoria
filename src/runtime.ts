@@ -439,9 +439,12 @@ export class MemoriaRuntime {
 				// search budget; the explicit tool call can take longer.
 				budgetMs: Math.min(this.config.sessionScanMs, 400),
 			}).catch(() => undefined);
-			if (fallback && fallback.hits.length > 0) {
-				result.sessionHits = fallback.hits;
+			if (fallback) {
+				// Stats are kept even with no hits: they carry the ripgrep status the
+				// caller warns about, and the renderers only show the excerpts when
+				// `sessionHits` is non-empty.
 				result.sessionStats = fallback.stats;
+				if (fallback.hits.length > 0) result.sessionHits = fallback.hits;
 			}
 		}
 		const wanted = options.rerank ?? this.config.rerank;
@@ -583,12 +586,15 @@ export class MemoriaRuntime {
 	/** Lazily create the transcript store (keys on config + agent dir). */
 	private sessions(): SessionStore {
 		const roots = this.sessionRoots();
-		const key = `${roots.join("|")}::${this.config.sessionCacheBytes}::${this.config.sessionExcerptChars}`;
+		const key = `${roots.join("|")}::${this.config.sessionCacheBytes}::${this.config.sessionExcerptChars}::${this.config.sessionRipgrep}`;
 		if (!this.sessionStore || this.sessionStoreKey !== key) {
 			this.sessionStore = new SessionStore({
 				roots,
 				cacheBytes: this.config.sessionCacheBytes,
 				excerptChars: this.config.sessionExcerptChars,
+				rgPath: this.config.sessionRipgrep ? undefined : null,
+				// pi ships ripgrep under <agent dir>/bin and puts it on PATH.
+				rgCandidates: [join(this.pathContext.agentDir, "bin", process.platform === "win32" ? "rg.exe" : "rg")],
 			});
 			this.sessionStoreKey = key;
 		}

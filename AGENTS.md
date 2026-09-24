@@ -241,8 +241,9 @@ src/usage.ts              hits/writes/last-used tracking (.index/usage.json).
 src/timeexpr.ts           "last week" → time windows.
 src/synonyms.ts           Query-side synonym tables (config + synonyms.json).
 src/transfer.ts           JSONL export/import with path sanitizing.
-src/sessions.ts           Transcript search: pi JSONL parsing, cache, ranking,
-                          bounded excerpts, window reads (read-only).
+src/sessions.ts           Transcript search: pi JSONL parsing, ripgrep prefilter,
+                          in-flight parse sharing, cache, ranking, bounded
+                          excerpts, window reads (read-only).
 src/recall.ts             Rendering of the system section and recall block.
 src/learn.ts              Session harvesting: chunking, prompt building, parsing.
 src/rerank.ts             Optional best-effort model reranker.
@@ -353,7 +354,19 @@ must stay free of pi runtime imports so they remain testable in isolation.
     labelled as evidence, and `recall()` attaches them **only** when the library
     returned nothing. A transcript parse is cached per file keyed by mtime+size
     and by variant (core vs includeTools) — a core parse must never be reused to
-    answer an `includeTools` search.
+    answer an `includeTools` search. Concurrent searches share one in-flight
+    parse per file and variant (a full parse may serve a default-view request,
+    never the reverse), so several `memoria_sessions` calls in one turn cannot
+    multiply read/parse work against the wall-clock budget. When `rg` is
+    available it may act as a *prefilter* — `ripgrepFiles()` lists transcripts
+    containing at least one needle and the rest are counted as scanned without
+    being parsed — but correctness never depends on it: `ripgrepNeedles()` must
+    stay conservative (every scoring term, plus one longest safe word per exact
+    phrase, plus the `…ies` form of terms ending in `y`), non-ASCII/non-CJK
+    queries disable the prefilter, and a missing, failing, timed-out or
+    overflowing `rg` falls back to the full scan. The fallback reason is
+    reported in `stats.ripgrep` and surfaced by the renderers, because a silent
+    slower scan on a large history can miss older sessions.
 18. **Persistence changes bump `INDEX_VERSION`.** `hydrate()` must defensively
     fill fields added after the first release, because a stale or corrupt index
     must rebuild from markdown rather than fail. The binary format stores posting
@@ -371,8 +384,10 @@ must stay free of pi runtime imports so they remain testable in isolation.
   corrupt-file recovery), watch filtering and link resolution.
 - `tests/sessions.test.ts` builds synthetic transcripts in pi's JSONL shape and
   covers extraction (thinking/tool exclusion), ranking, filters, corruption and
-  symlink skipping, cache invalidation, budgets, window reads and path refusals,
-  plus the runtime fallback and the tool. Keep a fixture with a user *correction*
+  symlink skipping, cache invalidation, concurrent in-flight parse sharing, the
+  ripgrep prefilter (via an executable fake, so a real `rg` is never required),
+  budgets, window reads and path refusals, plus the runtime fallback and the
+  tool. Keep a fixture with a user *correction*
   after an assistant claim: applying the correction is the behaviour that makes
   session recall trustworthy.
 - `tests/extension.test.ts` drives the real extension factory with a fake
@@ -424,10 +439,13 @@ the per-root lock. `memoria_move` in `src/tools.ts` and `/memoria move` in
 `merge: true`" guard: silently mixing two subjects into one file is worse than a
 failed move.
 
-**Change session search.** `src/sessions.ts` holds discovery, parsing, ranking
-and window reads; `MemoriaRuntime.sessionSearch/sessionRead` own configuration
-and the lazily created store; `renderSessionFallback` in `src/recall.ts` renders
-the evidence block for both the tool and auto-recall. New transcript entry types
+**Change session search.** `src/sessions.ts` holds discovery, the ripgrep
+prefilter (`ripgrepNeedles`/`ripgrepFiles`), parsing, ranking and window reads;
+`MemoriaRuntime.sessionSearch/sessionRead` own configuration and the lazily
+created store; `renderSessionFallback` in `src/recall.ts` renders the evidence
+block for both the tool and auto-recall. A prefilter change must keep the
+conservative-needle and graceful-fallback rules from invariant 17 and stay
+covered by `tests/sessions.test.ts` (fake `rg`, no dependency on a real one). New transcript entry types
 (`compaction`, `custom`, …) go behind `includeTools` unless they are genuine
 conversation turns. Bump the excerpt/message caps only with a test that proves
 the output stays bounded.

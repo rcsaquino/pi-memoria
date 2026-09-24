@@ -13,10 +13,10 @@ import type { AgentToolResult, ExtensionAPI, ExtensionContext } from "@earendil-
 import { Text } from "@earendil-works/pi-tui";
 import type { MemoriaRuntime } from "./runtime.ts";
 import { readStoreFile } from "./store.ts";
-import { renderSessionFallback } from "./recall.ts";
+import { renderSessionFallback, ripgrepNotice } from "./recall.ts";
 import { formatSessionTime } from "./sessions.ts";
 import { atomicWriteFile, oneLine, truncateChars } from "./util.ts";
-import type { Priority, Scope, SearchHit } from "./types.ts";
+import type { Priority, Scope, SearchHit, SessionScanStats } from "./types.ts";
 
 /** Inline export/import payload cap; larger dumps must use a file path. */
 const MAX_INLINE_TRANSFER_CHARS = 60_000;
@@ -762,17 +762,19 @@ export function registerMemoriaTools(pi: ExtensionAPI, getRuntime: RuntimeGetter
 				userOnly: params.user_only,
 			});
 			const stats = result.stats;
+			const notice = ripgrepNotice(stats.ripgrep);
 			if (result.hits.length === 0) {
 				const where = stats.roots.length > 0 ? stats.roots.join(", ") : "(no session directory found)";
 				return {
 					content: text(
-						`No saved conversation matched "${oneLine(params.query, 120)}".\nSearched ${where}: ${stats.files} sessions, ${stats.messages} messages (${(stats.bytes / 1_048_576).toFixed(1)} MB) in ${result.tookMs}ms${stats.partial ? " (partial scan: budget reached, results may be incomplete)" : ""}${stats.skipped > 0 ? `, skipped ${stats.skipped} unreadable records` : ""}.\nTry different wording, a name or date, or include_tools: true for tool output and compaction summaries.`,
+						`No saved conversation matched "${oneLine(params.query, 120)}".\nSearched ${where}: ${stats.files} sessions, ${stats.messages} messages (${(stats.bytes / 1_048_576).toFixed(1)} MB) in ${result.tookMs}ms${stats.partial ? " (partial scan: budget reached, results may be incomplete)" : ""}${stats.skipped > 0 ? `, skipped ${stats.skipped} unreadable records` : ""}.${notice ? `\nNote: ${notice}.` : ""}\nTry different wording, a name or date, or include_tools: true for tool output and compaction summaries.`,
 					),
-					details: { kind: "session", count: 0, partial: stats.partial },
+					details: { kind: "session", count: 0, partial: stats.partial, ripgrep: stats.ripgrep },
 				};
 			}
 			const lines = [
 				`${result.hits.length} match${result.hits.length === 1 ? "" : "es"} for "${oneLine(params.query, 120)}" in saved conversations (${result.tookMs}ms, ${stats.files} sessions / ${stats.messages} messages scanned${stats.cachedFiles > 0 ? `, ${stats.cachedFiles} cached` : ""}${stats.partial ? ", PARTIAL: budget reached" : ""}).`,
+				...(notice ? [`Note: ${notice}.`] : []),
 				"Evidence from raw transcripts, not curated memory.",
 				"",
 			];
@@ -788,7 +790,7 @@ export function registerMemoriaTools(pi: ExtensionAPI, getRuntime: RuntimeGetter
 			);
 			return {
 				content: text(lines.join("\n")),
-				details: { kind: "session", count: result.hits.length, partial: stats.partial },
+				details: { kind: "session", count: result.hits.length, partial: stats.partial, ripgrep: stats.ripgrep },
 			};
 		},
 		renderCall(args, theme) {
@@ -796,10 +798,11 @@ export function registerMemoriaTools(pi: ExtensionAPI, getRuntime: RuntimeGetter
 			return new Text(theme.fg("toolTitle", theme.bold("memoria_sessions ")) + theme.fg("accent", label), 0, 0);
 		},
 		renderResult(result, options, theme) {
-			const details = result.details as { kind?: string; count?: number; line?: number; partial?: boolean } | undefined;
+			const details = result.details as { kind?: string; count?: number; line?: number; partial?: boolean; ripgrep?: SessionScanStats["ripgrep"] } | undefined;
 			if (details?.kind === "session_read") return new Text(theme.fg("success", `✓ window at line ${details.line ?? "?"}`), 0, 0);
 			if (!details?.count) return new Text(theme.fg("warning", details?.partial ? "no matches (partial scan)" : "no matches"), 0, 0);
-			const text = theme.fg("success", `✓ ${details.count} past-session matches`) + theme.fg("dim", details.partial ? " (partial)" : "");
+			const slow = details?.ripgrep === "missing" || details?.ripgrep === "error";
+			const text = theme.fg("success", `✓ ${details.count} past-session matches`) + theme.fg("dim", `${details.partial ? " (partial)" : ""}${slow ? " (slower fallback: no ripgrep)" : ""}`);
 			return new Text(text + (options.expanded ? `\n${theme.fg("dim", "see output for excerpts and file:line")}` : ""), 0, 0);
 		},
 	});

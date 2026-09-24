@@ -87,11 +87,25 @@ export function renderSystemSection(input: SystemSectionInput): string {
  * Sessions are raw evidence rather than curated memory, so the block says so
  * explicitly and points at the verification step.
  */
-export function renderSessionFallback(hits: SessionHit[], stats?: Pick<SessionScanStats, "files" | "messages" | "partial">): string {
+/**
+ * Warn that transcript search fell back to the slower built-in scanner.
+ *
+ * `undefined` for every status where the fallback was intentional (`disabled`)
+ * or the accelerator was simply not applicable (`unsupported`, `skipped`).
+ */
+export function ripgrepNotice(status: SessionScanStats["ripgrep"]): string | undefined {
+	if (status === "missing") return "ripgrep is not installed, so transcripts are searched with the slower built-in scanner (large histories may be only partially covered)";
+	if (status === "error") return "ripgrep failed, so transcripts are searched with the slower built-in scanner";
+	return undefined;
+}
+
+export function renderSessionFallback(hits: SessionHit[], stats?: Pick<SessionScanStats, "files" | "messages" | "partial" | "ripgrep">): string {
 	const lines: string[] = [];
 	lines.push(
 		`No memory note matched. Found ${hits.length} possibly relevant message${hits.length === 1 ? "" : "s"} in saved earlier conversations${stats ? ` (scanned ${stats.files} sessions, ${stats.messages} messages${stats.partial ? ", partial scan" : ""})` : ""}:`,
 	);
+	const notice = stats ? ripgrepNotice(stats.ripgrep) : undefined;
+	if (notice) lines.push(`Note: ${notice}.`);
 	for (const hit of hits) {
 		lines.push(`- [${hit.role}, ${formatSessionTime(hit.timestamp)}] ${hit.projectName}: ${oneLine(hit.excerpt, 320)}`);
 		lines.push(`  file: ${hit.path}:${hit.line} (score ${hit.score}, matched: ${hit.matched.join(", ") || "-"})`);
@@ -113,7 +127,7 @@ export interface RecallRenderInput {
 	timeWindow?: TimeWindow;
 	/** Transcript excerpts returned when the library had no match. */
 	sessionHits?: SessionHit[];
-	sessionStats?: Pick<SessionScanStats, "files" | "messages" | "partial">;
+	sessionStats?: Pick<SessionScanStats, "files" | "messages" | "partial" | "ripgrep">;
 }
 
 /** Render the per-prompt recall block injected as a custom message. */
