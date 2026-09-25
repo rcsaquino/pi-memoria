@@ -46,7 +46,7 @@ test("ensureStore creates the layout and MEMORY.md", async () => {
 		assert.ok(existsSync(join(root, ".index")));
 		const hot = await readHot(root, 5000);
 		assert.equal(hot.exists, true);
-		assert.equal(hot.content.trim(), "# Memory");
+		assert.equal(hot.content.trim(), "");
 		assert.ok(!hot.content.includes("<!--"), "MEMORY.md must not contain annotations");
 	} finally {
 		await rm(root, { recursive: true, force: true });
@@ -293,10 +293,8 @@ test("addHotEntry writes prose and never injects labels", () => {
 	assert.ok(content.includes("Deploys go out Thursday mornings."));
 	assert.ok(!content.includes("Postgres migration — "), "the hint is not written into the file");
 
-	// Legacy bullet style input is normalized to a sentence.
-	const fourth = addHotEntry(content, "- Uses vim keybindings.");
-	assert.ok(!fourth.content.includes("- Uses vim keybindings."));
-	assert.ok(fourth.content.includes("Uses vim keybindings."));
+	// Invalid input is rejected rather than silently rewritten.
+	assert.throws(() => addHotEntry(content, "- Uses vim keybindings."), /plain prose/);
 });
 
 test("addHotEntry places facts with the paragraph that shares their topic", () => {

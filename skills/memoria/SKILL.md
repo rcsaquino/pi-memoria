@@ -52,8 +52,8 @@ bad file name, or consolidating notes that describe the same thing.
 - **A note is wrong** — write the correction with `memoria_write` using the same
   topic, or `supersedes` the old note when it replaces a decision.
 - **Never something again** — `memoria_forget` (soft delete into `.trash/`).
-- **Backup or migrate** — `memoria_export` to JSONL, `memoria_import` to restore
-  (`dry_run: true` first, `mode: "merge"` unless you mean to replace).
+- **Backup or migrate** — copy the store directory (`~/.pi/agent/memoria/`);
+  notes are plain markdown and `.index/` is derived.
 - **Search feels weak** — add `synonyms.json`, or check `/memoria status`.
 
 ## Do not
@@ -63,3 +63,15 @@ bad file name, or consolidating notes that describe the same thing.
 - Do not store secrets, credentials or tokens in the library.
 - Do not create a note per fact, and do not inline a fact into MEMORY.md when a
   library note would do.
+
+
+## Before editing MEMORY.md
+
+Read the current briefing first. Include only verified standing context useful
+across most sessions. Consolidate existing statements rather than appending
+paraphrases. Apply explicit corrections in place, ask about ambiguous conflicts,
+and preserve unrelated standing facts. Keep dated history and redundant skill
+instructions in the library/skills. Never use direct file edits to bypass validation.
+Replace requires the complete intended briefing. Compact will not drop facts to
+meet the budget; author a tighter replacement instead. Every changed supported
+write preserves a previous version under `.history/`.

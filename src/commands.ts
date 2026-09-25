@@ -6,17 +6,15 @@
  */
 
 import { existsSync } from "node:fs";
-import { isAbsolute, resolve } from "node:path";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { getMarkdownTheme } from "@earendil-works/pi-coding-agent";
 import { Markdown, Text } from "@earendil-works/pi-tui";
 import type { MemoriaRuntime } from "./runtime.ts";
 import type { RuntimeGetter } from "./tools.ts";
-import { harvestSession } from "./learn.ts";
 import { ripgrepNotice } from "./recall.ts";
 import { formatSessionTime } from "./sessions.ts";
 import { describeAge } from "./usage.ts";
-import { atomicWriteFile, oneLine } from "./util.ts";
+import { oneLine } from "./util.ts";
 import type { Scope } from "./types.ts";
 
 export const COMMAND_ENTRY_TYPE = "memoria_command";
@@ -34,9 +32,6 @@ const SUBCOMMANDS: Array<{ value: string; label: string; description: string }> 
 	{ value: "topics", label: "topics", description: "Review notes: size, facts, usage, merge candidates" },
 	{ value: "diff", label: "diff [days]", description: "Show memories created or updated recently" },
 	{ value: "sessions", label: "sessions <query>", description: "Search earlier conversations (raw transcripts)" },
-	{ value: "export", label: "export [file]", description: "Dump the store to JSONL" },
-	{ value: "import", label: "import <file>", description: "Restore memories from a JSONL export" },
-	{ value: "learn", label: "learn", description: "Extract durable memories from the current session" },
 	{ value: "paths", label: "paths", description: "Print store paths" },
 	{ value: "forget", label: "forget <id>", description: "Move a memory to .trash" },
 ];
@@ -73,7 +68,7 @@ async function statusMarkdown(runtime: MemoriaRuntime): Promise<string> {
 		lines.push(`**Categories:** ${[...categories.entries()].sort((a, b) => b[1] - a[1]).map(([category, count]) => `${category} (${count})`).join(", ")}`);
 	}
 	lines.push("");
-	lines.push(`**Auto-recall:** ${runtime.config.autoRecall ? `on (limit ${runtime.config.autoRecallLimit}, min score ${runtime.config.autoRecallMinScore})` : "off"} | **auto-learn:** ${runtime.config.autoLearn}`);
+	lines.push(`**Auto-recall:** ${runtime.config.autoRecall ? `on (limit ${runtime.config.autoRecallLimit}, min score ${runtime.config.autoRecallMinScore})` : "off"}`);
 	lines.push(`**Index:** ${runtime.config.indexFormat} | **rerank:** ${runtime.config.rerank ? runtime.config.rerankModel || "session model" : "off"} | **synonym table:** ${Object.keys(runtime.config.synonyms).length} inline`);
 	lines.push(
 		`**Session recall:** ${runtime.config.sessionSearch ? (runtime.config.sessionFallback ? "on (falls back when memory is empty)" : "on (explicit only)") : "off"} | roots: ${runtime.sessionRoots().filter((root) => existsSync(root)).length}`,
@@ -352,78 +347,6 @@ export function registerMemoriaCommand(pi: ExtensionAPI, getRuntime: RuntimeGett
 						}
 					}
 					emit(pi, `memoria diff: last ${Number.isFinite(days) ? days : 7} days`, lines.join("\n"));
-					return;
-				}
-				case "export": {
-					const flags = remainder.split(/\s+/).filter(Boolean);
-					// `--hot` exports MEMORY.md alone as a readable "about me" document.
-					if (flags.includes("--hot")) {
-						const fileArg = flags.find((flag) => !flag.startsWith("--"));
-						const target = fileArg
-							? isAbsolute(fileArg)
-								? fileArg
-								: resolve(ctx.cwd, fileArg)
-							: resolve(ctx.cwd, "about-me.md");
-						const hot = await runtime.hotState();
-						await atomicWriteFile(target, `${hot.content.trim()}\n`);
-						emit(pi, "memoria export", `Wrote MEMORY.md (${hot.chars} chars) to \`${target}\`.`);
-						return;
-					}
-					const fileArg = flags.find((flag) => !flag.startsWith("--"));
-					const { jsonl, notes } = await runtime.exportJsonl({ scope: "all" });
-					const target = fileArg
-						? isAbsolute(fileArg)
-							? fileArg
-							: resolve(ctx.cwd, fileArg)
-						: resolve(ctx.cwd, `memoria-export-${new Date().toISOString().slice(0, 10)}.jsonl`);
-					await atomicWriteFile(target, jsonl);
-					emit(pi, "memoria export", `Exported ${notes} note(s) to \`${target}\` (${jsonl.length} bytes).`);
-					return;
-				}
-				case "import": {
-					if (!remainder) {
-						ctx.ui.notify("Usage: /memoria import <file> [--merge|--replace|--skip] [--dry-run]", "warning");
-						return;
-					}
-					const flags = remainder.split(/\s+/);
-					const fileArg = flags.find((flag) => !flag.startsWith("--"));
-					if (!fileArg) {
-						ctx.ui.notify("Usage: /memoria import <file> [--merge|--replace|--skip] [--dry-run]", "warning");
-						return;
-					}
-					const mode = flags.includes("--replace") ? "replace" : flags.includes("--skip") ? "skip" : "merge";
-					const dryRun = flags.includes("--dry-run");
-					const target = isAbsolute(fileArg) ? fileArg : resolve(ctx.cwd, fileArg);
-					const { readFile } = await import("node:fs/promises");
-					const payload = await readFile(target, "utf8");
-					const result = await runtime.importJsonl(payload, { mode, dryRun });
-					const lines = [
-						`${dryRun ? "Dry run:" : "Imported"} ${result.created.length} new, ${result.updated.length} updated, ${result.skipped} skipped.`,
-					];
-					if (result.hotImported) lines.push("MEMORY.md restored.");
-					if (result.errors.length > 0) lines.push("", "**Skipped records:**", ...result.errors.slice(0, 20).map((error) => `- ${error}`));
-					emit(pi, `memoria import: ${oneLine(fileArg, 60)}`, lines.join("\n"));
-					return;
-				}
-				case "learn": {
-					ctx.ui.notify("Extracting durable memories from this session...", "info");
-					const branch = ctx.sessionManager.getBranch() as ReadonlyArray<{ type?: string; message?: { role?: string; content?: unknown } }>;
-					const result = await harvestSession(ctx, runtime, branch, {
-						chunkChars: runtime.config.learnChunkChars,
-						onProgress: (update) => {
-							if (update.total > 1) {
-								setStatus(ctx, `memoria: extracting memories... ${update.index}/${update.total}`);
-								ctx.ui.notify(`Extracting memories (${update.index}/${update.total})...`, "info");
-							}
-						},
-					});
-					setStatus(ctx, undefined);
-					const lines: string[] = [];
-					if (result.error) lines.push(result.error);
-					if (result.created.length > 0) lines.push(`**Created ${result.created.length}:**\n${result.created.map((id) => `- \`${id}\``).join("\n")}`);
-					if (result.updated.length > 0) lines.push(`**Updated ${result.updated.length}:**\n${result.updated.map((id) => `- \`${id}\``).join("\n")}`);
-					if (result.skipped > 0) lines.push(`_${result.skipped} candidate(s) could not be merged._`);
-					emit(pi, "memoria learn", lines.join("\n\n") || "Nothing durable found in this session.");
 					return;
 				}
 				case "paths": {

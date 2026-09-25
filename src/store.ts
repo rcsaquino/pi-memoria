@@ -1360,9 +1360,36 @@ export async function readHot(root: string, limit: number): Promise<HotState> {
 	return { path, content, chars, limit, over: chars > limit, exists: true };
 }
 
-/** Write MEMORY.md atomically. Callers enforce/validate the budget. */
-export async function writeHot(root: string, content: string): Promise<void> {
-	await atomicWriteFile(join(root, HOT_FILE), content.endsWith("\n") ? content : `${content}\n`);
+/** Validate the complete briefing, without silently cutting or removing facts.
+ * Semantic eligibility and correction checks remain the calling agent's job.
+ * The legacy empty/template title is accepted and removed during migration.
+ */
+export function validateHot(content: string, limit = 5000): string {
+	const prose = content.replace(/^# Memory[ \t]*(?:\r?\n|$)/, "").trim();
+	if (/^\s*(?:#{1,6}\s|[-*+]\s|\d+[.)]\s|>|```|~~~|\|)/m.test(prose) || /<!--|-->/.test(prose)) {
+		throw new Error("MEMORY.md must be plain prose: no headings, lists, tables, code fences or annotations.");
+	}
+	const normalized = prose ? `${prose}\n` : "";
+	if (normalized.length > limit) throw new Error(`MEMORY.md exceeds its ${limit}-character budget. Rewrite more tightly; no content was saved or truncated.`);
+	const seen = new Set<string>();
+	for (const paragraph of normalized.split(/\n\s*\n/)) for (const unit of splitHotUnits(paragraph)) {
+		const key = unit.toLowerCase().replace(/\s+/g, " ").trim();
+		if (key && seen.has(key)) throw new Error("MEMORY.md contains a repeated sentence. Consolidate it before saving.");
+		seen.add(key);
+	}
+	return normalized;
+}
+
+/** All supported briefing writes validate first and preserve the previous version. */
+export async function writeHot(root: string, content: string, limit = 5000): Promise<void> {
+	const next = validateHot(content, limit);
+	const path = join(root, HOT_FILE);
+	const previous = await readFileOrUndefined(path);
+	if (previous === next) return;
+	if (previous !== undefined) {
+		await atomicWriteFile(join(root, ".history", `${newMemoryId()}-MEMORY.md`), previous);
+	}
+	await atomicWriteFile(path, next);
 }
 
 /**
@@ -1466,7 +1493,8 @@ export interface HotAddResult {
  * marker or anchor text is ever written into the file.
  */
 export function addHotEntry(content: string, text: string, topic?: string): HotAddResult {
-	const sentence = oneLine(text, 1200).replace(/^[-*]\s*/, "").trim();
+	validateHot(text, Number.MAX_SAFE_INTEGER);
+	const sentence = oneLine(text).trim();
 	if (!sentence) return { content, changed: false, paragraph: "", created: false };
 	const blocks = splitHotParagraphs(content);
 	const title = blocks.find(isTitleBlock);
@@ -1642,7 +1670,7 @@ export async function ensureStore(root: string, hotLimit: number, defaultCategor
 	await mkdir(join(root, LIBRARY_DIR, defaultCategory), { recursive: true });
 	await mkdir(join(root, INDEX_DIR), { recursive: true });
 	const hot = await readHot(root, hotLimit);
-	if (!hot.exists) await writeHot(root, hotTemplate());
+	if (!hot.exists) await writeHot(root, hotTemplate(), hotLimit);
 }
 
 /** Resolve a user-supplied memory reference (id, alias, relative path, or absolute path). */

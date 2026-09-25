@@ -34,7 +34,8 @@ export const DEFAULT_CONFIG: MemoriaConfig = {
 	hotLimit: 5000,
 	snippetChars: 280,
 	autoRecall: true,
-	autoRecallLimit: 6,
+	autoRecallLimit: 3,
+	autoRecallMinRatio: 0.3,
 	autoRecallMinScore: 1.4,
 	autoRecallMaxChars: 2400,
 	autoRecallLastTurns: 1,
@@ -60,11 +61,6 @@ export const DEFAULT_CONFIG: MemoriaConfig = {
 	rerankModel: "",
 	rerankTopK: 12,
 	rerankTimeoutMs: 2500,
-	autoLearn: "off",
-	autoLearnMinTurns: 8,
-	autoLearnMinChars: 2000,
-	autoLearnCooldownMs: 21_600_000,
-	learnChunkChars: 12_000,
 	watcherSettleMs: 300,
 	indexFormat: "auto",
 	sessionSearch: true,
@@ -132,6 +128,7 @@ function coerceConfig(raw: unknown): Partial<MemoriaConfig> {
 	if (number(input.snippetChars) !== undefined) out.snippetChars = Math.max(80, number(input.snippetChars)!);
 	if (bool(input.autoRecall) !== undefined) out.autoRecall = bool(input.autoRecall);
 	if (number(input.autoRecallLimit) !== undefined) out.autoRecallLimit = Math.max(0, Math.min(20, number(input.autoRecallLimit)!));
+	if (number(input.autoRecallMinRatio) !== undefined) out.autoRecallMinRatio = Math.max(0, Math.min(1, number(input.autoRecallMinRatio)!));
 	if (number(input.autoRecallMinScore) !== undefined) out.autoRecallMinScore = Math.max(0, number(input.autoRecallMinScore)!);
 	if (number(input.autoRecallMaxChars) !== undefined) out.autoRecallMaxChars = Math.max(200, number(input.autoRecallMaxChars)!);
 	if (number(input.autoRecallLastTurns) !== undefined) out.autoRecallLastTurns = Math.max(0, Math.min(5, number(input.autoRecallLastTurns)!));
@@ -156,11 +153,6 @@ function coerceConfig(raw: unknown): Partial<MemoriaConfig> {
 	if (number(input.rerankTopK) !== undefined) out.rerankTopK = Math.max(1, Math.min(50, number(input.rerankTopK)!));
 	if (number(input.rerankTimeoutMs) !== undefined) out.rerankTimeoutMs = Math.max(250, Math.min(30_000, number(input.rerankTimeoutMs)!));
 	if (number(input.synonymWeight) !== undefined) out.synonymWeight = Math.max(0.1, Math.min(1, number(input.synonymWeight)!));
-	if (str(input.autoLearn) && ["off", "on-settle", "on-shutdown"].includes(input.autoLearn as string)) out.autoLearn = input.autoLearn as string;
-	if (number(input.autoLearnMinTurns) !== undefined) out.autoLearnMinTurns = Math.max(1, number(input.autoLearnMinTurns)!);
-	if (number(input.autoLearnMinChars) !== undefined) out.autoLearnMinChars = Math.max(200, number(input.autoLearnMinChars)!);
-	if (number(input.autoLearnCooldownMs) !== undefined) out.autoLearnCooldownMs = Math.max(0, number(input.autoLearnCooldownMs)!);
-	if (number(input.learnChunkChars) !== undefined) out.learnChunkChars = Math.max(2000, number(input.learnChunkChars)!);
 	if (number(input.watcherSettleMs) !== undefined) out.watcherSettleMs = Math.max(0, Math.min(5000, number(input.watcherSettleMs)!));
 	if (str(input.indexFormat) && ["auto", "json", "binary"].includes(input.indexFormat as string)) out.indexFormat = input.indexFormat as string;
 	if (bool(input.sessionSearch) !== undefined) out.sessionSearch = bool(input.sessionSearch);

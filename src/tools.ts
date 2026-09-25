@@ -6,8 +6,6 @@
  * returned when explicitly requested.
  */
 
-import { readFile } from "node:fs/promises";
-import { isAbsolute, resolve } from "node:path";
 import { Type } from "typebox";
 import type { AgentToolResult, ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
@@ -15,11 +13,8 @@ import type { MemoriaRuntime } from "./runtime.ts";
 import { readStoreFile } from "./store.ts";
 import { renderSessionFallback, ripgrepNotice } from "./recall.ts";
 import { formatSessionTime } from "./sessions.ts";
-import { atomicWriteFile, oneLine, truncateChars } from "./util.ts";
+import { oneLine, truncateChars } from "./util.ts";
 import type { Priority, Scope, SearchHit, SessionScanStats } from "./types.ts";
-
-/** Inline export/import payload cap; larger dumps must use a file path. */
-const MAX_INLINE_TRANSFER_CHARS = 60_000;
 
 export type RuntimeGetter = (ctx: ExtensionContext) => Promise<MemoriaRuntime>;
 
@@ -103,7 +98,7 @@ const WriteParams = Type.Object({
 const HotParams = Type.Object({
 	action: Type.Union([Type.Literal("add"), Type.Literal("remove"), Type.Literal("replace"), Type.Literal("read"), Type.Literal("compact")], {
 		description:
-			"add: append a sentence to a theme paragraph. remove: delete every sentence containing a substring. replace: rewrite the whole file as prose. read: show it. compact: trim to the character budget.",
+			"add: append a sentence to a theme paragraph. remove: delete every sentence containing a substring. replace: rewrite the whole file as prose. read: show it. compact: check the budget without deleting facts; if oversized, use replace with a tighter supported briefing.",
 	}),
 	topic: Type.Optional(
 		Type.String({
@@ -169,29 +164,6 @@ const SessionsParams = Type.Object({
 	window: Type.Optional(Type.Number({ description: "For action=read: messages of context on each side (default 6, max 40)." })),
 });
 
-const ExportParams = Type.Object({
-	path: Type.Optional(
-		Type.String({
-			description: "Write the JSONL dump to this file (absolute, or relative to the working directory). Without it a bounded preview is returned inline.",
-		}),
-	),
-	include_hot: Type.Optional(Type.Boolean({ description: "Include MEMORY.md as a record (default true)." })),
-	scope: Type.Optional(ScopeEnum),
-});
-
-const ImportParams = Type.Object({
-	path: Type.Optional(Type.String({ description: "JSONL file to import (absolute, or relative to the working directory)." })),
-	content: Type.Optional(Type.String({ description: "Inline JSONL content. Prefer `path` for anything larger than a few notes." })),
-	mode: Type.Optional(
-		Type.Union([Type.Literal("merge"), Type.Literal("replace"), Type.Literal("skip")], {
-			description:
-				"merge (default): add facts that are missing from a note with the same id. replace: overwrite notes with the same id. skip: only import notes that do not exist yet.",
-		}),
-	),
-	dry_run: Type.Optional(Type.Boolean({ description: "Report what would happen without writing anything." })),
-	scope: Type.Optional(ScopeEnum),
-});
-
 const ForgetParams = Type.Object({
 	id: Type.String({ description: "Memory id to remove. The file is moved to .trash/ rather than deleted." }),
 	scope: Type.Optional(ScopeEnum),
@@ -238,10 +210,10 @@ export function registerMemoriaTools(pi: ExtensionAPI, getRuntime: RuntimeGetter
 		name: "memoria_recall",
 		label: "Recalling memories",
 		description:
-			"Search long-term memory (the memoria library) for anything the user has said or that was learned in past sessions. Use this before answering questions about people, preferences, projects, decisions, past incidents or anything possibly stored earlier. Returns ranked notes with ids, paths and excerpts; call memoria_read for full text.",
-		promptSnippet: "memoria_recall: search long-term memory before answering anything possibly known from before",
+			"Search long-term memory (the memoria library) for anything the user has said or that was learned in past sessions. Use when evidence already recalled into context is insufficient for a question about prior facts. Returns ranked notes with ids, paths and excerpts; call memoria_read for full text.",
+		promptSnippet: "memoria_recall: search prior facts when recalled context is insufficient",
 		promptGuidelines: [
-			"Call memoria_recall before answering questions about people, preferences, projects, decisions or prior conversations.",
+			"Use relevant recalled context directly; call memoria_recall when it is insufficient.",
 			"Never say you do not remember without calling memoria_recall first.",
 			"Use memoria_recall with several focused queries when a first search returns nothing but the topic is likely stored.",
 		],
@@ -433,7 +405,7 @@ export function registerMemoriaTools(pi: ExtensionAPI, getRuntime: RuntimeGetter
 				lines.push(`NOTE: ${result.topicNote}. Prefer a broad grouping name so related facts stay together.`);
 			}
 			lines.push(
-				`MEMORY.md is at ${hot.chars}/${hot.limit} chars${hot.over ? ' (OVER BUDGET — run memoria_hot { action: "compact" } or move detail into the library)' : ""}.`,
+				`MEMORY.md is at ${hot.chars}/${hot.limit} chars${hot.over ? ' (OVER BUDGET — rewrite with memoria_hot { action: "replace" } or move detail into the library)' : ""}.`,
 			);
 			// Housekeeping hints are best-effort: a failure must not fail the write.
 			try {
@@ -498,6 +470,8 @@ export function registerMemoriaTools(pi: ExtensionAPI, getRuntime: RuntimeGetter
 			"MEMORY.md is loaded on every request, so it is only for facts that pay off that often: identity, timezone/locale, communication style, hard constraints, and the current state of active work.",
 			"Write MEMORY.md as a short, natural introduction to the user plus their standing context. Sentences and paragraphs only — no headings, no bullet lists, no 'Topic — fact' labels.",
 			"Keep occasional details (URLs, versions, file paths, history, rationale) in library notes; recall finds them when needed.",
+			"Before every edit, read the briefing. Consolidate existing statements instead of appending paraphrases. Apply explicit corrections in place; ask about ambiguous conflicts. Preserve unrelated standing facts. Eligibility and factual correctness require your judgment; deterministic validation cannot establish truth.",
+			"Do not repeat skill instructions or dated maintenance history. Every statement must be supported by the user or verified evidence.",
 			"When MEMORY.md grows past a few paragraphs, rewrite it tighter with memoria_hot { action: \"replace\" } and file the dropped detail into the library rather than appending forever.",
 		],
 		parameters: HotParams,
@@ -552,7 +526,7 @@ export function registerMemoriaTools(pi: ExtensionAPI, getRuntime: RuntimeGetter
 					return {
 						content: text(
 							`MEMORY.md compacted: ${result.before} → ${result.after}/${runtime.config.hotLimit} chars.${
-								result.before === result.after ? " Already under budget." : " Least-important trailing paragraphs were dropped. Next time prefer action=replace with a tighter summary."
+								result.before === result.after ? " Already under budget." : " No facts are automatically dropped."
 							}${dropped}`,
 						),
 						details: { kind: "hot", chars: result.after, limit: runtime.config.hotLimit },
@@ -804,105 +778,6 @@ export function registerMemoriaTools(pi: ExtensionAPI, getRuntime: RuntimeGetter
 			const slow = details?.ripgrep === "missing" || details?.ripgrep === "error";
 			const text = theme.fg("success", `✓ ${details.count} past-session matches`) + theme.fg("dim", `${details.partial ? " (partial)" : ""}${slow ? " (slower fallback: no ripgrep)" : ""}`);
 			return new Text(text + (options.expanded ? `\n${theme.fg("dim", "see output for excerpts and file:line")}` : ""), 0, 0);
-		},
-	});
-
-	pi.registerTool<typeof ExportParams, { kind: string; notes?: number; bytes?: number; path?: string }, unknown>({
-		name: "memoria_export",
-		label: "Exporting memories",
-		description:
-			"Export the memory store as JSONL (one record per line: notes plus MEMORY.md) for backup or migration. With `path` the full dump is written to that file; without it a bounded preview is returned. Pair with memoria_import to restore.",
-		promptSnippet: "memoria_export: dump the memory store to JSONL for backup or migration",
-		parameters: ExportParams,
-		async execute(_toolCallId, params, _signal, _onUpdate, ctx): Promise<AgentToolResult<any>> {
-			const runtime = await getRuntime(ctx);
-			const { jsonl, notes } = await runtime.exportJsonl({
-				scope: (params.scope as Scope | undefined) ?? "all",
-				includeHot: params.include_hot !== false,
-			});
-			if (params.path) {
-				const target = isAbsolute(params.path) ? params.path : resolve(ctx.cwd, params.path);
-				await atomicWriteFile(target, jsonl);
-				return {
-					content: text(`Exported ${notes} note(s) to ${target} (${jsonl.length} bytes of JSONL).`),
-					details: { kind: "export", notes, bytes: jsonl.length, path: target },
-				};
-			}
-			const preview = truncateChars(jsonl, MAX_INLINE_TRANSFER_CHARS);
-			const truncated = jsonl.length > preview.length;
-			return {
-				content: text(
-					`${notes} note(s) exported (${jsonl.length} bytes).${truncated ? `\n\nInline preview truncated at ${MAX_INLINE_TRANSFER_CHARS} chars; pass \`path\` to write the complete dump.` : ""}\n\n${preview}`,
-				),
-				details: { kind: "export", notes, bytes: jsonl.length },
-			};
-		},
-		renderCall(args, theme) {
-			return new Text(theme.fg("toolTitle", theme.bold("memoria_export ")) + theme.fg("dim", args.path ?? "inline preview"), 0, 0);
-		},
-		renderResult(result, _options, theme) {
-			const details = result.details as { notes?: number; path?: string } | undefined;
-			return new Text(theme.fg("success", `✓ exported ${details?.notes ?? 0} notes`) + theme.fg("dim", details?.path ? ` → ${details.path}` : ""), 0, 0);
-		},
-	});
-
-	pi.registerTool<typeof ImportParams, { kind: string; created?: number; updated?: number; skipped?: number; errors?: number }, unknown>({
-		name: "memoria_import",
-		label: "Importing memories",
-		description:
-			"Import notes from a JSONL file (or inline content) produced by memoria_export. Never overwrites an existing note unless mode=replace: merge adds only the facts that are missing, and a path already taken by another note gets a numbered sibling. Use dry_run first on an unfamiliar file.",
-		promptSnippet: "memoria_import: restore memories from a JSONL export",
-		promptGuidelines: [
-			"Run memoria_import with dry_run: true first when importing a file you did not create.",
-			"Prefer mode=merge (the default) when importing into a store that already has memories.",
-		],
-		parameters: ImportParams,
-		executionMode: "sequential",
-		async execute(_toolCallId, params, _signal, _onUpdate, ctx): Promise<AgentToolResult<any>> {
-			const runtime = await getRuntime(ctx);
-			let payload = params.content ?? "";
-			if (params.path) {
-				const target = isAbsolute(params.path) ? params.path : resolve(ctx.cwd, params.path);
-				const file = await readFile(target, "utf8");
-				if (file.length > 20_000_000) throw new Error(`Refusing to import ${file.length} chars; split the file first.`);
-				payload = payload ? `${file}\n${payload}` : file;
-			}
-			if (!payload.trim()) throw new Error("Nothing to import: pass `path` or `content`.");
-			const result = await runtime.importJsonl(payload, {
-				mode: (params.mode as "merge" | "replace" | "skip" | undefined) ?? "merge",
-				scope: (params.scope as Scope | undefined) ?? "primary",
-				dryRun: params.dry_run === true,
-			});
-			const lines = [
-				`${params.dry_run ? "Dry run: would import" : "Imported"} ${result.created.length} new note(s), updated ${result.updated.length}, skipped ${result.skipped}.`,
-			];
-			if (result.hotImported) lines.push("MEMORY.md was restored from the export.");
-			if (result.errors.length > 0) lines.push(`Skipped ${result.errors.length} malformed record(s):\n${result.errors.slice(0, 10).join("\n")}`);
-			return {
-				content: text(lines.join("\n")),
-				details: {
-					kind: "import",
-					created: result.created.length,
-					updated: result.updated.length,
-					skipped: result.skipped,
-					errors: result.errors.length,
-				},
-			};
-		},
-		renderCall(args, theme) {
-			return new Text(
-				theme.fg("toolTitle", theme.bold("memoria_import ")) + theme.fg("accent", oneLine(args.path ?? "inline", 60)) + theme.fg("dim", args.mode ? ` (${args.mode})` : ""),
-				0,
-				0,
-			);
-		},
-		renderResult(result, _options, theme) {
-			const details = result.details as { created?: number; updated?: number; skipped?: number } | undefined;
-			return new Text(
-				theme.fg("success", `✓ +${details?.created ?? 0} ~${details?.updated ?? 0}`) + theme.fg("dim", ` skipped ${details?.skipped ?? 0}`),
-				0,
-				0,
-			);
 		},
 	});
 

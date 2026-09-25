@@ -25,8 +25,7 @@ import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import { MemoriaRuntime } from "./src/runtime.ts";
 import { registerMemoriaTools } from "./src/tools.ts";
 import { registerMemoriaCommand, setStatus } from "./src/commands.ts";
-import { RECALL_CUSTOM_TYPE, buildRecallParts, renderRecallBlock, renderStatusLine, renderSystemSection, ripgrepNotice } from "./src/recall.ts";
-import { buildTranscriptText, harvestSession } from "./src/learn.ts";
+import { RECALL_CUSTOM_TYPE, cleanRecallPrompt, selectAutoRecallHits, recallFingerprint, visibleRecallFingerprints, buildRecallParts, renderRecallBlock, renderStatusLine, renderSystemSection, ripgrepNotice } from "./src/recall.ts";
 import { createModelReranker } from "./src/rerank.ts";
 import { tokenizeRaw } from "./src/tokenize.ts";
 import { KeyedMutex, oneLine } from "./src/util.ts";
@@ -41,11 +40,6 @@ export default function memoria(pi: ExtensionAPI) {
 	let recentPrompts: string[] = [];
 	/** The missing-ripgrep warning is shown once per session, not on every prompt. */
 	let ripgrepWarned = false;
-	/** Auto-learn bookkeeping: user turns since the last extraction, and when. */
-	let turnsSinceLearn = 0;
-	let lastLearnAt = 0;
-	let learnInFlight = false;
-
 	/** Resolve (and lazily initialize) the runtime for this working directory. */
 	const getRuntime = (ctx: ExtensionContext): Promise<MemoriaRuntime> => runtimeLock.run("runtime", async () => {
 		if (!runtime || runtimeCwd !== ctx.cwd) {
@@ -66,9 +60,6 @@ export default function memoria(pi: ExtensionAPI) {
 			runtimeCwd = ctx.cwd;
 			hotCache = undefined;
 			recentPrompts = [];
-			turnsSinceLearn = 0;
-			lastLearnAt = 0;
-			learnInFlight = false;
 		}
 		return runtime;
 	});
@@ -118,7 +109,7 @@ export default function memoria(pi: ExtensionAPI) {
 
 			// Layer 1: stable system-prompt section with MEMORY.md + library map.
 			const hot = await readHotCached(memoria_);
-			const overview = await memoria_.overview(4);
+			const overview = await memoria_.overview(0);
 			event.systemPromptOptions.sections.memoria = renderSystemSection({
 				root: memoria_.roots.primary,
 				hotContent: hot.over ? hot.content.slice(0, hot.limit) : hot.content,
@@ -128,16 +119,14 @@ export default function memoria(pi: ExtensionAPI) {
 				categories: overview.categories,
 				totalDocs: overview.docs,
 				indexTookMs: 0,
-				recent: overview.recent,
 			});
 
 			// Reranking is opt-in and best-effort; the lexical order is the fallback.
 			memoria_.setReranker(memoria_.config.rerank ? createModelReranker(ctx) : undefined);
 
 			// Layer 2: per-prompt recall block.
-			turnsSinceLearn += 1;
 			if (!memoria_.config.autoRecall) return undefined;
-			const prompt = event.prompt ?? "";
+			const prompt = cleanRecallPrompt(event.prompt ?? "");
 			if (prompt.trimStart().startsWith("/")) return undefined;
 			const tokens = tokenizeRaw(prompt);
 			if (tokens.length < 2 && !/\d/.test(prompt)) return undefined;
@@ -149,10 +138,15 @@ export default function memoria(pi: ExtensionAPI) {
 				ctx.ui.notify(`memoria: ${rgNotice}.`, "warning");
 			}
 			recentPrompts = [...recentPrompts, prompt].slice(-RECENT_PROMPT_LIMIT);
-			const hits = result.hits.filter((hit) => hit.score >= memoria_.config.autoRecallMinScore);
+			const tables = await Promise.all([...new Set(result.hits.map(hit => hit.doc.root))].map(root => memoria_.synonymsFor(root)));
+			const synonyms: Record<string, string[]> = {};
+			for (const table of tables) for (const [term, values] of Object.entries(table)) synonyms[term] = [...(synonyms[term] ?? []), ...values];
+			const relevant = selectAutoRecallHits(result.hits, prompt, memoria_.config.autoRecallMinScore, memoria_.config.autoRecallMinRatio, synonyms);
+			const seen = visibleRecallFingerprints(ctx.sessionManager.buildContextEntries?.() ?? ctx.sessionManager.getBranch());
+			const hits = relevant.filter(hit => !seen.has(recallFingerprint(hit)));
 			// Nothing in the library? Show what earlier conversations said instead
 			// of leaving the model with nothing to go on.
-			const sessionHits = hits.length === 0 ? result.sessionHits : undefined;
+			const sessionHits = relevant.length === 0 ? result.sessionHits : undefined;
 			if (hits.length === 0 && (!sessionHits || sessionHits.length === 0)) return undefined;
 			const rendered = renderRecallBlock({
 				query: oneLine(prompt, 160),
@@ -164,12 +158,14 @@ export default function memoria(pi: ExtensionAPI) {
 				sessionHits,
 				sessionStats: result.sessionStats,
 			});
+			if (!rendered) return undefined;
+			const included = hits.filter(hit => rendered.includes(`- [${hit.doc.id}]`));
 			return {
 				message: {
 					customType: RECALL_CUSTOM_TYPE,
 					content: rendered,
 					display: true,
-					details: { ids: hits.map((hit) => hit.doc.id), tookMs: result.tookMs, sessionHits: sessionHits?.length ?? 0 },
+					details: { ids: included.map((hit) => hit.doc.id), fingerprints: included.map(recallFingerprint), tookMs: result.tookMs, sessionHits: sessionHits?.length ?? 0 },
 				},
 			};
 		} catch (error) {
@@ -179,68 +175,7 @@ export default function memoria(pi: ExtensionAPI) {
 		}
 	});
 
-	/**
-	 * Automatic session learning.
-	 *
-	 * Runs only when configured, only after enough conversation has accumulated,
-	 * and at most once per cooldown window. It never blocks the turn: extraction
-	 * happens after the agent loop ends.
-	 */
-	const maybeAutoLearn = async (ctx: ExtensionContext, trigger: "settle" | "shutdown"): Promise<void> => {
-		if (!runtime || learnInFlight) return;
-		const mode = runtime.config.autoLearn;
-		if (mode === "off") return;
-		if (mode === "on-settle" && trigger !== "settle") return;
-		if (mode === "on-shutdown" && trigger !== "shutdown") return;
-		if (turnsSinceLearn < runtime.config.autoLearnMinTurns) return;
-		const now = Date.now();
-		if (now - lastLearnAt < runtime.config.autoLearnCooldownMs) return;
-		const branch = ctx.sessionManager.getBranch() as ReadonlyArray<{ type?: string; message?: { role?: string; content?: unknown } }>;
-		// The character floor keeps a burst of tiny turns from triggering a model
-		// call that has nothing to extract from.
-		const transcriptChars = buildTranscriptText(branch, 40_000).length;
-		if (transcriptChars < runtime.config.autoLearnMinChars) return;
-		learnInFlight = true;
-		lastLearnAt = now;
-		turnsSinceLearn = 0;
-		try {
-			setStatus(ctx, "memoria: extracting memories...");
-			const result = await harvestSession(ctx, runtime, branch, {
-				chunkChars: runtime.config.learnChunkChars,
-				onProgress: (update) => {
-					if (update.total > 1) setStatus(ctx, `memoria: extracting memories... ${update.index}/${update.total}`);
-				},
-			});
-			const total = result.created.length + result.updated.length;
-			if (total > 0) {
-				ctx.ui.notify(`memoria: learned ${total} note${total === 1 ? "" : "s"} (${result.created.length} new, ${result.updated.length} updated)`, "info");
-			} else if (result.error) {
-				setStatus(ctx, undefined);
-			}
-		} catch (error) {
-			ctx.ui.notify(`memoria: auto-learn failed: ${(error as Error).message}`, "warning");
-		} finally {
-			learnInFlight = false;
-			try {
-				const stats = await runtime.stats();
-				const docs = stats.roots.reduce((sum, entry) => sum + entry.docs, 0);
-				setStatus(ctx, renderStatusLine(runtime.config, docs, stats.hot.chars, 0));
-			} catch {
-				setStatus(ctx, undefined);
-			}
-		}
-	};
-
-	pi.on("agent_end", async (_event, ctx) => {
-		await maybeAutoLearn(ctx, "settle").catch(() => {});
-	});
-
-	pi.on("session_shutdown", async (_event, ctx) => {
-		try {
-			await maybeAutoLearn(ctx, "shutdown");
-		} catch {
-			// Shutdown must never throw.
-		}
+	pi.on("session_shutdown", async (_event, _ctx) => {
 		await runtimeLock.run("runtime", async () => {
 			await runtime?.flushUsageNow().catch(() => {});
 			await runtime?.dispose().catch(() => {});

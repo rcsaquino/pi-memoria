@@ -349,6 +349,8 @@ export interface MemoriaConfig {
 	/** Auto-recall tuning. */
 	autoRecall: boolean;
 	autoRecallLimit: number;
+	/** Minimum fraction of the strongest eligible score for automatic recall. */
+	autoRecallMinRatio: number;
 	autoRecallMinScore: number;
 	autoRecallMaxChars: number;
 	/** Number of previous user turns folded into the recall query. */
@@ -402,16 +404,6 @@ export interface MemoriaConfig {
 	rerankTopK: number;
 	/** Reranker budget in milliseconds; falls back to lexical order on timeout. */
 	rerankTimeoutMs: number;
-	/** Automatic session extraction: off, on-settle (idle) or on-shutdown. */
-	autoLearn: string;
-	/** Minimum user turns before auto-learn considers a session. */
-	autoLearnMinTurns: number;
-	/** Minimum transcript characters before auto-learn considers a session. */
-	autoLearnMinChars: number;
-	/** Minimum time between automatic extractions. */
-	autoLearnCooldownMs: number;
-	/** Characters per extraction chunk when harvesting a session. */
-	learnChunkChars: number;
 	/** Idle delay after a filesystem event before refreshing the index. */
 	watcherSettleMs: number;
 	/** Index persistence format: auto (binary above a threshold), json or binary. */

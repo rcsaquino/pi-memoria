@@ -31,9 +31,9 @@ A pi extension that gives the agent long-term memory:
   a last resort: `memoria_sessions`, an automatic fallback when the library
   returns nothing, and `/memoria sessions`. Results are raw evidence with
   `file:line` citations, never merged into the library.
-- Ten tools (`memoria_recall`, `memoria_write`, `memoria_read`, `memoria_move`,
-  `memoria_hot`, `memoria_list`, `memoria_forget`, `memoria_export`,
-  `memoria_import`, `memoria_sessions`), a `/memoria` command with subcommands,
+- Eight tools (`memoria_recall`, `memoria_write`, `memoria_read`, `memoria_move`,
+  `memoria_hot`, `memoria_list`, `memoria_forget`, `memoria_sessions`), a
+  `/memoria` command with subcommands,
   and two skills: `skills/memoria/SKILL.md` (store maintenance) and
   `skills/memoria-sessions/SKILL.md` (searching and verifying transcripts).
 
@@ -222,7 +222,7 @@ literal and silently produces a broken pattern.
 
 ```
 index.ts                  Extension entry point: lifecycle hooks, system-prompt
-                          section, auto-recall, auto-learn, message renderer.
+                          section, auto-recall, message renderer.
 src/types.ts              All shared types. No runtime imports.
 src/util.ts               Atomic writes, mutex, debounce, ids, hashing, paths.
 src/frontmatter.ts        YAML-subset frontmatter parser/serializer (zero deps).
@@ -240,14 +240,12 @@ src/similarity.ts         Duplicate-subject and contradiction detection.
 src/usage.ts              hits/writes/last-used tracking (.index/usage.json).
 src/timeexpr.ts           "last week" → time windows.
 src/synonyms.ts           Query-side synonym tables (config + synonyms.json).
-src/transfer.ts           JSONL export/import with path sanitizing.
 src/sessions.ts           Transcript search: pi JSONL parsing, ripgrep prefilter,
                           in-flight parse sharing, cache, ranking, bounded
                           excerpts, window reads (read-only).
 src/recall.ts             Rendering of the system section and recall block.
-src/learn.ts              Session harvesting: chunking, prompt building, parsing.
 src/rerank.ts             Optional best-effort model reranker.
-src/runtime.ts            Roots, locks, search cache, scopes, health, transfer.
+src/runtime.ts            Roots, locks, search cache, scopes, health.
 src/tools.ts              pi tool definitions (schemas, execute, TUI renderers).
 src/commands.ts           /memoria subcommands + entry renderer.
 tests/                    node:test suites, eval harness, bench. Everything is
@@ -256,7 +254,7 @@ skills/memoria/SKILL.md   Maintenance instructions for other agents.
 ```
 
 Dependency direction is one-way: `types/util → tokenize/frontmatter → store →
-index-engine → search → recall/learn → runtime → tools/commands → index.ts`,
+index-engine → search → recall → runtime → tools/commands → index.ts`,
 with `sessions.ts` (like `store.ts`) importing only from `types/util/tokenize`.
 Never import upward from a lower layer; `store.ts`, `search.ts` and `sessions.ts`
 must stay free of pi runtime imports so they remain testable in isolation.
@@ -312,23 +310,21 @@ must stay free of pi runtime imports so they remain testable in isolation.
    Trash names include a random suffix so two same-named notes deleted in one
    millisecond cannot overwrite each other.
 8. **Index freshness**: after writing through `runtime.write`/`updateMemoryById`/
-   `forget`/`move`/`import`, update the in-memory index directly; never rely on a
+   `forget`/`move`, update the in-memory index directly; never rely on a
    rescan. External edits are caught by `index.refresh()` (watcher settle timer +
    TTL). Any mutation or external change must call `bumpCacheGeneration()`; a
    stale cached search result after a write is a correctness bug. Check index
    freshness before serving a cached search result, and key the cache on every
    option that changes ranking or filtering, including weighted query parts.
-9. **Never throw from `before_agent_start`, `agent_end` or `session_shutdown`.**
-   Recall and auto-learn failures must be swallowed with a notification; the turn
-   must continue.
+9. **Never throw from `before_agent_start` or `session_shutdown`.** Recall
+   failures must be swallowed with a notification; the turn must continue.
 10. **Writes are serialized.** Every read-modify-write path in `MemoriaRuntime`
     goes through the per-root `KeyedMutex`, and `memoria_write` / `memoria_hot` /
-    `memoria_forget` / `memoria_move` / `memoria_import` declare
-    `executionMode: "sequential"`. Two parallel writes to the same topic must both
-    survive; see the concurrency tests in `tests/runtime.test.ts`. The mutex is
-    **not reentrant**: never call a runtime method that takes the root lock from
-    inside `locks.run(root, …)` (import handles MEMORY.md by calling `writeHot`
-    directly). First loads of a root share one promise, and the extension
+    `memoria_forget` / `memoria_move` declare `executionMode: "sequential"`. Two
+    parallel writes to the same topic must both survive; see the concurrency tests
+    in `tests/runtime.test.ts`. The mutex is **not reentrant**: never call a
+    runtime method that takes the root lock from inside `locks.run(root, …)`.
+    First loads of a root share one promise, and the extension
     serializes runtime initialization, so concurrent calls cannot see a
     half-loaded index or create separate runtimes.
 11. **Scope semantics.** `primary` is the user-level store and the default write
@@ -345,10 +341,10 @@ must stay free of pi runtime imports so they remain testable in isolation.
     `coerceConfig`, actual use (grep for it), and a row in the README table.
 15. **Keep zero runtime dependencies** in core modules. `typebox`,
     `@earendil-works/pi-*` are supplied by pi and are only imported by the
-    extension-facing modules (`index.ts`, `tools.ts`, `commands.ts`, `learn.ts`,
+    extension-facing modules (`index.ts`, `tools.ts`, `commands.ts`,
     `rerank.ts`).
 16. **Optional features degrade, they never break.** Synonyms, reranking, usage
-    tracking, auto-learn, time hints and related expansion must all be safe to
+    tracking, time hints and related expansion must all be safe to
     disable or fail: fall back to lexical order/plain behaviour and continue.
 17. **Session search is read-only, bounded and honest.** `src/sessions.ts` never
     writes a transcript; `readWindow` refuses paths outside the configured roots;
@@ -387,10 +383,10 @@ must stay free of pi runtime imports so they remain testable in isolation.
 ## Testing philosophy
 
 - Pure logic gets unit tests (`frontmatter`, `tokenize`, `store`, `search`,
-  `learn`, `recall`, `knowledge` — the housekeeping modules).
+  `recall`, `knowledge` — the housekeeping modules).
 - `tests/runtime.test.ts` exercises the real `MemoriaRuntime` against a temp
   directory, including concurrency, the search cache, usage flush, journal
-  recovery, export/import, reranking and project scopes.
+  recovery, reranking and project scopes.
 - `tests/engine.test.ts` covers index persistence (JSON and binary round-trips,
   corrupt-file recovery), watch filtering and link resolution.
 - `tests/sessions.test.ts` builds synthetic transcripts in pi's JSONL shape and
@@ -438,8 +434,8 @@ frontmatter keys must round-trip unchanged; new indexed fields need
 fact detector: pronoun subjects, personal verbs, `RELATION_NOUNS`, `POSSESSIVE`),
 `resolveTopic` (fallback + reporting), `appendFact` (how facts are laid out) and
 `extendSummary`. Update the `GOOD topics` / `BAD topics` examples in
-`src/learn.ts`'s prompt and in `src/tools.ts`'s `topic` description together, then
-extend `tests/store.test.ts`. `slugify()` strips apostrophes so possessives join
+`src/tools.ts`'s `topic` description, then
+`extend tests/store.test.ts`. `slugify()` strips apostrophes so possessives join
 (`John's father` → `johns-father`) instead of splitting into `john-s-father`.
 
 **Change how a note is renamed or consolidated.** `moveMemory()` in
@@ -553,3 +549,14 @@ Package-shape invariants live in
    table, and are actually read somewhere.
 6. New skills under `skills/` have `name`/`description` frontmatter (the
    description is what tells the model when to load them).
+
+
+## Briefing write boundary
+
+Every supported MEMORY.md mutation uses `writeHot(root, content, hotLimit)` and
+`validateHot`. Validate before backing up or changing the file. Preserve previous
+versions in `.history/`, which watchers ignore. Do not silently truncate adds or
+compact by deleting facts. Exact sentence deduplication
+is mechanical; semantic eligibility, contradictions and preservation are explicitly
+agent responsibilities, not claimed guarantees. Direct file edits bypass this
+boundary. New regressions cover rejected writes, backups and safe compaction.

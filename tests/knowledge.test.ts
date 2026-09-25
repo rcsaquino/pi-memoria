@@ -1,6 +1,6 @@
 /**
  * Tests for the "housekeeping" modules: usage tracking, similarity, time
- * expressions, synonyms and JSONL transfer. All pure or filesystem-local.
+ * expressions and synonyms. All pure or filesystem-local.
  */
 
 import { test } from "node:test";
@@ -12,8 +12,6 @@ import { UsageStore, describeAge } from "../src/usage.ts";
 import { cosineSimilarity, jaccard, hasNegation, contentTokens, suggestMerges, detectContradictions, mergesFor, compareDocs, makeIdf, namesLinked, type SimilarityDoc } from "../src/similarity.ts";
 import { parseTimeExpression } from "../src/timeexpr.ts";
 import { normalizeSynonymTable, mergeSynonymTables, expandSynonymTable, loadSynonymsFile, synonymsFor, synonymsFileTemplate } from "../src/synonyms.ts";
-import { decodeJsonl, encodeJsonl, sanitizeRelPath, writeImportedNote } from "../src/transfer.ts";
-import { ensureStore, readMemoryDoc } from "../src/store.ts";
 
 async function tempRoot(prefix = "memoria-knowledge-"): Promise<string> {
 	return mkdtemp(join(tmpdir(), prefix));
@@ -214,82 +212,6 @@ test("loadSynonymsFile reads a store file and tolerates junk", async () => {
 });
 
 /* ------------------------------------------------------------------ */
-/* JSONL transfer                                                      */
-/* ------------------------------------------------------------------ */
-
-test("sanitizeRelPath rejects traversal and non-library paths", () => {
-	assert.equal(sanitizeRelPath("library/people/alice.md"), "library/people/alice.md");
-	assert.equal(sanitizeRelPath("/etc/passwd"), undefined);
-	assert.equal(sanitizeRelPath("library/../../etc/passwd.md"), undefined);
-	assert.equal(sanitizeRelPath("library/.hidden/x.md"), undefined);
-	assert.equal(sanitizeRelPath("MEMORY.md"), undefined);
-	assert.equal(sanitizeRelPath("library/people/alice.txt"), undefined);
-	assert.equal(sanitizeRelPath("library/INDEX.md"), undefined);
-	assert.equal(sanitizeRelPath("library/people\\alice.md"), "library/people/alice.md");
-});
-
-test("jsonl encode/decode round-trips and reports bad lines", () => {
-	const line = encodeJsonl({
-		type: "memory",
-		id: "mem_1_ab",
-		relPath: "library/people/alice.md",
-		title: "Alice",
-		category: "people",
-		tags: ["a"],
-		aliases: ["Alice Smith"],
-		related: [],
-		supersedes: [],
-		summary: "s",
-		priority: "high",
-		confidence: "medium",
-		body: "# Alice\n\nLikes tea.",
-	});
-	const hot = encodeJsonl({ type: "hot", content: "# Memory\n\nAlice likes tea." });
-	const { records, errors } = decodeJsonl(`${line}\n${hot}\nnot json\n{"type":"mystery"}\n`);
-	assert.equal(records.length, 2);
-	assert.equal(errors.length, 2);
-	const memory = records[0];
-	assert.equal(memory.type, "memory");
-	if (memory.type === "memory") {
-		assert.equal(memory.id, "mem_1_ab");
-		assert.equal(memory.priority, "high");
-		assert.deepEqual(memory.aliases, ["Alice Smith"]);
-	}
-	assert.equal(records[1].type, "hot");
-});
-
-test("writeImportedNote preserves ids and never overwrites another note", async () => {
-	const root = await tempRoot();
-	try {
-		await ensureStore(root, 5000, "inbox");
-		const base = {
-			relPath: "library/people/alice.md",
-			title: "Alice",
-			category: "people",
-			tags: ["alice"],
-			aliases: [],
-			related: [],
-			supersedes: [],
-			summary: "Alice facts",
-			priority: "normal",
-			confidence: "medium",
-			body: "# Alice\n\nLikes tea.",
-		};
-		const first = await writeImportedNote(root, { ...base, id: "mem_import_1" });
-		assert.equal(first.id, "mem_import_1");
-		assert.equal(first.relPath, "library/people/alice.md");
-		// A different id at the same path must land in a sibling file.
-		const second = await writeImportedNote(root, { ...base, id: "mem_import_2" });
-		assert.equal(second.id, "mem_import_2");
-		assert.notEqual(second.relPath, first.relPath);
-		const reread = await readMemoryDoc(root, first.path);
-		assert.equal(reread?.id, "mem_import_1");
-		assert.ok(reread?.body.includes("Likes tea."));
-	} finally {
-		await rm(root, { recursive: true, force: true });
-	}
-});
-
 test("a name link needs more than a shared word", () => {
 	const john: SimilarityDoc = { id: "j", title: "John Doe", relPath: "library/people/john-doe.md", category: "people", aliases: [], tokens: {} };
 	const bob: SimilarityDoc = {

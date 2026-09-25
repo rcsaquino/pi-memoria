@@ -273,7 +273,7 @@ test("renderSystemSection includes rules, hot memory and category map", () => {
 	assert.ok(section.includes("memoria_recall"));
 	assert.ok(section.includes("User prefers dark mode"));
 	assert.ok(section.includes("people (3), projects (2)"));
-	assert.ok(section.includes("Recently learned"));
+	assert.ok(!section.includes("Recently learned"), "recent notes must not churn the system prefix");
 	assert.ok(section.includes("MEMORY.md budget: 40/5000"));
 });
 
@@ -343,7 +343,7 @@ test("renderRecallBlock stays within the character budget", () => {
 	const rendered = renderRecallBlock({ query: "memory", hits, maxChars: 800, tookMs: 1.2 });
 	assert.ok(rendered.startsWith("<memoria_recall"));
 	assert.ok(rendered.endsWith("</memoria_recall>"));
-	assert.ok(rendered.length < 1400, `rendered length was ${rendered.length}`);
+	assert.ok(rendered.length <= 800, `rendered length was ${rendered.length}`);
 	assert.ok(rendered.includes("[mem_0]"));
 	assert.ok(rendered.includes("memoria_read"));
 });
@@ -487,12 +487,17 @@ test("a merged note remains editable through the source's former id", async () =
 	});
 });
 
-test("a merged imported note keeps a nonstandard former id", async () => {
+test("a merged directly-written note keeps a nonstandard id", async () => {
 	await withRuntime(async (runtime) => {
-		await runtime.importJsonl(JSON.stringify({
-			type: "memory", id: "legacy_alice_7", relPath: "library/people/alice-work.md",
-			title: "Alice work", category: "people", body: "# Alice work\n\nAlice knows Rust.",
-		}));
+		await mkdir(join(runtime.roots.primary, "library", "people"), { recursive: true });
+		await writeFile(
+			join(runtime.roots.primary, "library", "people", "alice-work.md"),
+			["---", "id: legacy_alice_7", "title: Alice work", "topic: Alice work", "category: people", "tags: [alice]", "summary: Alice knows Rust.", "---", "", "# Alice work", "", "- Alice knows Rust.", ""].join("\n"),
+			"utf8",
+		);
+		const index = await runtime.indexFor(runtime.roots.primary);
+		index.dirty = true;
+		await runtime.search("rust");
 		const target = await runtime.write({ topic: "Alice", category: "people", content: "Alice knows Go." });
 		await runtime.move("legacy_alice_7", { topic: "Alice", merge: true });
 		assert.equal((await runtime.readMemory("legacy_alice_7"))?.doc.id, target.result.doc.id);
@@ -590,13 +595,6 @@ test("cached searches observe external edits and imported notes", async () => {
 
 		assert.equal((await runtime.search("quartz")).hits.length, 0);
 		assert.equal((await runtime.search("quartz")).cached, true);
-		await runtime.importJsonl(JSON.stringify({
-			type: "memory", id: "mem_import_cache", relPath: "library/projects/quartz.md",
-			title: "Quartz", category: "projects", body: "# Quartz\n\nQuartz uses columnar storage.",
-		}));
-		const imported = await runtime.search("quartz");
-		assert.notEqual(imported.cached, true);
-		assert.equal(imported.hits[0]?.doc.id, "mem_import_cache");
 	});
 });
 
@@ -685,47 +683,6 @@ test("repeated writes and doctor power the promotion and health reports", async 
 	});
 });
 
-test("export and import round-trip notes and MEMORY.md between stores", async () => {
-	await withRuntime(async (runtime) => {
-		const note = await runtime.write({
-			topic: "Migration plan",
-			content: "Step one is to freeze writes.",
-			category: "projects",
-			tags: ["migration"],
-			aliases: ["Big move"],
-		});
-		await runtime.hotAdd("The user is migrating the platform in Q3.", "migration");
-		const { jsonl, notes } = await runtime.exportJsonl({ scope: "primary" });
-		assert.equal(notes, 1);
-		assert.ok(jsonl.includes("memoria"));
-
-		const otherHome = await mkdtemp(join(tmpdir(), "memoria-home2-"));
-		const other = new MemoriaRuntime("/tmp", { home: otherHome, agentDir: join(otherHome, ".pi", "agent") });
-		try {
-			await other.init(true);
-			const imported = await other.importJsonl(jsonl, { mode: "merge", scope: "primary" });
-			assert.equal(imported.created.length, 1);
-			assert.equal(imported.hotImported, true);
-			const found = await other.readMemory(note.result.doc.id, "primary");
-			assert.ok(found, "the imported note keeps its id");
-			assert.ok(found!.doc.body.includes("freeze writes"));
-			assert.deepEqual(found!.doc.aliases, ["Big move"]);
-			const hot = await other.hotState();
-			assert.ok(hot.content.includes("migrating the platform"));
-			// Importing the same dump again is a no-op, not a duplicate.
-			const again = await other.importJsonl(jsonl, { mode: "merge", scope: "primary" });
-			assert.equal(again.created.length, 0);
-			assert.equal(again.skipped, 1);
-			// A dry run must not write anything.
-			const dry = await other.importJsonl(jsonl.replace(/Step one/, "Step two"), { mode: "merge", dryRun: true });
-			assert.deepEqual(dry.created, []);
-		} finally {
-			await other.dispose();
-			await rm(otherHome, { recursive: true, force: true });
-		}
-	});
-});
-
 test("an interrupted move is repaired from the journal on the next start", async () => {
 	const cwd = await mkdtemp(join(tmpdir(), "memoria-journal-cwd-"));
 	const home = await mkdtemp(join(tmpdir(), "memoria-journal-home-"));
@@ -788,4 +745,30 @@ test("sessionDelta reports what changed since the previous session", async () =>
 		assert.equal(quiet!.created.length, 0);
 		assert.equal(quiet!.updated.length, 0);
 	});
+});
+
+test("briefing writes reject invalid proposals without changing the previous version", async () => {
+ await withRuntime(async runtime => {
+  await runtime.hotReplace("The user prefers concise replies.");
+  const before = (await runtime.hotState()).content;
+  for (const text of ["# Preferences\n\nConcise replies.", "- Concise replies.", "<!-- hidden -->Hello.", "x".repeat(5001), "Same sentence. Same sentence."]) {
+   await assert.rejects(() => runtime.hotReplace(text));
+   assert.equal((await runtime.hotState()).content, before);
+  }
+  await assert.rejects(() => runtime.hotAdd("The user prefers concise replies."), /repeated/);
+  await runtime.hotReplace("The user prefers concise and candid replies.");
+  const { readdir } = await import("node:fs/promises");
+  const history = join(runtime.roots.primary, ".history");
+  const versions = await Promise.all((await readdir(history)).map(file => readFile(join(history, file), "utf8")));
+  assert.ok(versions.includes(before));
+ });
+});
+
+test("briefing compaction refuses to drop an oversized briefing", async () => {
+ await withRuntime(async runtime => {
+  await runtime.hotReplace("The user prefers concise replies.");
+  await writeFile(join(runtime.roots.primary, "MEMORY.md"), "x".repeat(6000));
+  await assert.rejects(() => runtime.hotCompact(), /never drops/);
+  assert.equal((await runtime.hotState()).chars, 6000);
+ });
 });

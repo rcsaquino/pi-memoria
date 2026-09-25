@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -115,10 +115,8 @@ test("registers the memoria tools and the /memoria command", async () => {
 		assert.deepEqual(
 			[...harness.tools.keys()].sort(),
 			[
-				"memoria_export",
 				"memoria_forget",
 				"memoria_hot",
-				"memoria_import",
 				"memoria_list",
 				"memoria_move",
 				"memoria_read",
@@ -337,8 +335,7 @@ test("memoria_hot add and compact respect the budget", async () => {
 		assert.ok(String(read.content[0].text).includes("dark mode"));
 		assert.ok(!String(read.content[0].text).includes("Preferences —"), "no label written into MEMORY.md");
 		assert.ok(!String(read.content[0].text).includes("<!--"));
-		const replace = await hot.execute("call-3", { action: "replace", text: `# Memory\n\n${"x".repeat(6000)}` }, undefined, undefined, harness.ctx);
-		assert.equal(replace.details.over, true);
+		await assert.rejects(() => hot.execute("call-3", { action: "replace", text: "x".repeat(6000) }, undefined, undefined, harness.ctx), /budget/);
 		const compact = await hot.execute("call-4", { action: "compact" }, undefined, undefined, harness.ctx);
 		assert.ok(compact.details.chars <= 5000);
 		assert.equal(compact.details.over, undefined);
@@ -367,8 +364,8 @@ test("failures inside tools surface as thrown errors, not crashes", async () => 
 	});
 });
 
-test("/memoria topics, diff, export and import work headlessly", async () => {
-	await withHarness(async (harness, cwd) => {
+test("/memoria topics and diff work headlessly", async () => {
+	await withHarness(async (harness) => {
 		await harness.emit("session_start", { type: "session_start", reason: "startup" }, harness.ctx);
 		const write = harness.tools.get("memoria_write")!;
 		await write.execute("w1", { topic: "Staging", content: "The staging URL is staging.example.com.", category: "knowledge", tags: ["staging"] }, undefined, undefined, harness.ctx);
@@ -383,40 +380,6 @@ test("/memoria topics, diff, export and import work headlessly", async () => {
 		await command.handler("diff 1", harness.ctx);
 		const diff = String((harness.entries[harness.entries.length - 1].data as { markdown: string }).markdown);
 		assert.ok(diff.includes("New ("), diff);
-
-		const exportPath = join(cwd, "backup.jsonl");
-		await command.handler(`export ${exportPath}`, harness.ctx);
-		const exported = await readFile(exportPath, "utf8");
-		assert.ok(exported.includes("library/knowledge/staging.md"));
-		assert.ok(exported.includes("staging.example.com"));
-
-		await command.handler(`import ${exportPath}`, harness.ctx);
-		const imported = String((harness.entries[harness.entries.length - 1].data as { markdown: string }).markdown);
-		assert.ok(imported.includes("skipped"), imported);
-
-		const hotPath = join(cwd, "about-me.md");
-		await command.handler(`export --hot ${hotPath}`, harness.ctx);
-		const about = await readFile(hotPath, "utf8");
-		assert.ok(about.length > 0);
-	});
-});
-
-test("memoria_export and memoria_import tools round-trip through a file", async () => {
-	await withHarness(async (harness, cwd) => {
-		await harness.emit("session_start", { type: "session_start", reason: "startup" }, harness.ctx);
-		const write = harness.tools.get("memoria_write")!;
-		await write.execute("w1", { topic: "Alice", content: "Alice likes tea.", category: "people", tags: ["alice"] }, undefined, undefined, harness.ctx);
-		const exportTool = harness.tools.get("memoria_export")!;
-		const target = join(cwd, "dump.jsonl");
-		const exported = await exportTool.execute("e1", { path: target }, undefined, undefined, harness.ctx);
-		assert.ok(String(exported.content[0].text).includes("Exported 1 note"));
-		assert.ok((await readFile(target, "utf8")).includes("Alice likes tea."));
-
-		const importTool = harness.tools.get("memoria_import")!;
-		const dry = await importTool.execute("i1", { path: target, dry_run: true }, undefined, undefined, harness.ctx);
-		assert.ok(String(dry.content[0].text).includes("Dry run"));
-		const real = await importTool.execute("i2", { path: target, mode: "merge" }, undefined, undefined, harness.ctx);
-		assert.ok(String(real.content[0].text).includes("skipped 1"), String(real.content[0].text));
 	});
 });
 
@@ -432,5 +395,36 @@ test("memoria_recall explain returns a scoring breakdown", async () => {
 		assert.ok(text.includes("bm25"));
 		const superseded = await recall.execute("r2", { query: "oat milk", drop_superseded: true }, undefined, undefined, harness.ctx);
 		assert.ok(String(superseded.content[0].text).includes("matching memories"));
+	});
+});
+
+test("auto recall strips metadata and suppresses only evidence still in the active context", async () => {
+	await withHarness(async (harness) => {
+		const result = await harness.tools.get("memoria_write")!.execute("write", {
+			topic: "Deploy window", content: "Production deploys happen on Thursday mornings.", category: "workflows",
+		}, undefined, undefined, harness.ctx);
+		const branch: any[] = [];
+		(harness.ctx.sessionManager as any).buildContextEntries = () => branch;
+		const event = {
+			type: "before_agent_start", prompt: "[telegram] When can I deploy to production?\n[time] 2026-09-25 10:36:33 Asia/Manila",
+			systemPromptOptions: { sections: {} },
+		};
+		const invoke = async () => (await harness.emit("before_agent_start", event, harness.ctx))[0]?.message;
+		const first = await invoke();
+		assert.ok(first, harness.notifications.join(" | "));
+		assert.ok(!first.content.includes("2026") && !first.content.includes("telegram"));
+		assert.equal(first.details.fingerprints.length, 1);
+		branch.push({ type: "custom_message", ...first });
+		assert.equal(await invoke(), undefined);
+		branch.push({ type: "compaction" });
+		const afterCompact = await invoke();
+		assert.ok(afterCompact);
+		branch.push({ type: "custom_message", ...afterCompact });
+		await harness.tools.get("memoria_write")!.execute("update", {
+			id: result.details.id, topic: "Deploy window", content: "Production deploys now happen on Friday mornings.",
+		}, undefined, undefined, harness.ctx);
+		assert.ok(await invoke(), "changed note must be recalled again");
+		branch.length = 0;
+		assert.ok(await invoke(), "another branch must not inherit suppression");
 	});
 });

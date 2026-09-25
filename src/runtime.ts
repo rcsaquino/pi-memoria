@@ -9,7 +9,6 @@
  * - Track hits/writes/last-used (`UsageStore`) outside the search path.
  * - Merge several roots with rank normalization so no store is drowned.
  * - Report health: duplicate topics, contradictions, staleness, promotion.
- * - Export and import the store as JSONL.
  */
 
 import { existsSync } from "node:fs";
@@ -20,18 +19,14 @@ import { DEFAULT_CONFIG, INDEX_DIR, LIBRARY_DIR, loadConfig, resolveRoots, resol
 import { MemoryIndex, createIndexSaver, isIgnoredWatchPath } from "./index-engine.ts";
 import {
 	addHotEntry,
-	appendFact,
 	categorySummary,
 	createMemory,
 	deleteMemory,
-	deriveSummary,
 	ensureStore,
-	extendSummary,
 	extractFactUnits,
 	hotTemplate,
 	looksAtomicTopic,
 	moveMemory,
-	normalizePriority,
 	priorityRank,
 	readHot,
 	recoverJournal,
@@ -39,9 +34,9 @@ import {
 	renderLibraryIndexes,
 	resolveMemoryRef,
 	touchLastUsed,
-	trimHot,
 	updateMemory,
 	writeHot,
+	validateHot,
 	type CreateMemoryInput,
 	type CreateMemoryResult,
 	type IndexListingDoc,
@@ -53,7 +48,6 @@ import { SessionStore } from "./sessions.ts";
 import { UsageStore } from "./usage.ts";
 import { compareDocs, detectContradictions, isComparableTerm, suggestMerges, type SimilarityDoc } from "./similarity.ts";
 import { expandSynonymTable, loadSynonymsFile, mergeSynonymTables } from "./synonyms.ts";
-import { decodeJsonl, encodeJsonl, writeImportedNote, type ImportedNote } from "./transfer.ts";
 import { KeyedMutex, atomicWriteFile, debounce, normalizePath, oneLine, readFileOrUndefined } from "./util.ts";
 import type {
 	Contradiction,
@@ -707,57 +701,6 @@ export class MemoriaRuntime {
 		return { result, root };
 	}
 
-	/** Append a fact to an existing note by id (used by session learning). */
-	async appendToNote(
-		id: string,
-		input: { content: string; label?: string; tags?: string[]; summary?: string; priority?: string; confidence?: string; source?: string },
-		scope: Scope = "all",
-	): Promise<{ doc: MemoryDoc; duplicate: boolean } | undefined> {
-		const candidates = scope === "all" ? this.activeRoots("all") : [this.rootForScope(scope)];
-		for (const root of candidates) {
-			const locked = await this.locks.run(root, async () => this.appendToNoteLocked(root, id, input));
-			if (locked) {
-				this.bumpCacheGeneration();
-				return locked;
-			}
-		}
-		return undefined;
-	}
-
-	private async appendToNoteLocked(
-		root: string,
-		id: string,
-		input: { content: string; label?: string; tags?: string[]; summary?: string; priority?: string; confidence?: string; source?: string },
-	): Promise<{ doc: MemoryDoc; duplicate: boolean } | undefined> {
-		const state = await this.storeFor(root);
-		const idx = state.index.idxForId(id);
-		if (idx === undefined) return undefined;
-		const doc = await resolveMemoryRef(root, id, liveLookup(state.index));
-		if (!doc) return undefined;
-		const appended = appendFact(doc.body, input.label, input.content);
-		if (!appended.changed) return { doc, duplicate: true };
-		const tags = input.tags ? [...new Set([...doc.tags, ...input.tags])] : undefined;
-		const priority = input.priority && priorityRank(normalizePriority(input.priority)) > priorityRank(doc.priority) ? input.priority : undefined;
-		const summary = extendSummary(doc.summary, input.summary ?? deriveSummary(input.content));
-		const updated = await updateMemory(root, doc, {
-			content: appended.body,
-			tags,
-			summary,
-			priority,
-			confidence: input.confidence,
-			source: input.source,
-		});
-		state.index.removeDoc(idx);
-		state.index.addDoc(updated);
-		state.index.builtAt = Date.now();
-		state.saver.schedule();
-		if (state.usage) {
-			state.usage.record(updated.id, "write");
-			state.usageSaver();
-		}
-		return { doc: updated, duplicate: false };
-	}
-
 	async updateMemoryById(
 		id: string,
 		input: UpdateMemoryInput & { scope?: Scope },
@@ -922,7 +865,7 @@ export class MemoriaRuntime {
 			const state = await readHot(root, this.config.hotLimit);
 			const content = state.exists ? state.content : hotTemplate();
 			const added = addHotEntry(content, text, topic);
-			if (added.changed) await writeHot(root, added.content);
+			if (added.changed) await writeHot(root, added.content, this.config.hotLimit);
 			return {
 				before: state.chars,
 				after: added.content.length,
@@ -937,7 +880,7 @@ export class MemoriaRuntime {
 		return this.locks.run(root, async () => {
 			const state = await readHot(root, this.config.hotLimit);
 			const [next, removed] = removeHotMatches(state.content, pattern);
-			await writeHot(root, next);
+			await writeHot(root, next, this.config.hotLimit);
 			return { before: state.chars, after: next.length, removed };
 		});
 	}
@@ -945,19 +888,20 @@ export class MemoriaRuntime {
 	async hotReplace(content: string, root = this.roots.primary): Promise<{ before: number; after: number }> {
 		return this.locks.run(root, async () => {
 			const state = await readHot(root, this.config.hotLimit);
-			await writeHot(root, content);
-			return { before: state.chars, after: content.length };
+			await writeHot(root, content, this.config.hotLimit);
+			return { before: state.chars, after: validateHot(content, this.config.hotLimit).length };
 		});
 	}
 
-	/** Trim MEMORY.md to the configured budget, reporting what was cut. */
+	/** Check the briefing without deleting facts to meet the budget. */
 	async hotCompact(root = this.roots.primary): Promise<{ before: number; after: number; removed: string }> {
 		return this.locks.run(root, async () => {
 			const state = await readHot(root, this.config.hotLimit);
-			if (!state.over) return { before: state.chars, after: state.chars, removed: "" };
-			const trimmed = trimHot(state.content, this.config.hotLimit);
-			await writeHot(root, trimmed.content);
-			return { before: state.chars, after: trimmed.content.length, removed: trimmed.removed };
+			if (!state.over) {
+				validateHot(state.content, this.config.hotLimit);
+				return { before: state.chars, after: state.chars, removed: "" };
+			}
+			throw new Error("MEMORY.md is over budget. Read it and use action=replace with a tighter briefing preserving standing facts; compact never drops facts automatically.");
 		});
 	}
 
@@ -1282,159 +1226,6 @@ export class MemoriaRuntime {
 		}
 		const byRecency = (a: DiffEntry, b: DiffEntry): number => b.updated - a.updated;
 		return { since, created: created.sort(byRecency), updated: updated.sort(byRecency) };
-	}
-
-	/* ---------------------------------------------------------------- */
-	/* Export / import                                                   */
-	/* ---------------------------------------------------------------- */
-
-	/** Serialize the store as JSONL (one record per line, plus MEMORY.md). */
-	async exportJsonl(options: { scope?: Scope; includeHot?: boolean; includeTrash?: boolean } = {}): Promise<{ jsonl: string; notes: number }> {
-		const roots = this.activeRoots(options.scope ?? "all");
-		const lines: string[] = [];
-		let notes = 0;
-		for (const root of roots) {
-			const state = await this.storeFor(root);
-			await this.refreshIndex(state.index);
-			const hot = await readHot(root, this.config.hotLimit);
-			if (options.includeHot !== false && hot.exists && hot.content.trim()) {
-				lines.push(encodeJsonl({ type: "hot", root: this.displayPath(root), content: hot.content }));
-			}
-			for (const { idx, meta } of state.index.liveDocs()) {
-				const body = await state.index.bodyFor(idx);
-				lines.push(
-					encodeJsonl({
-						type: "memory",
-						id: meta.id,
-						relPath: meta.relPath,
-						root: this.displayPath(root),
-						title: meta.title,
-						category: meta.category,
-						tags: meta.tags,
-						aliases: meta.aliases,
-						related: meta.related,
-						supersedes: meta.supersedes,
-						summary: meta.summary,
-						priority: meta.priority,
-						confidence: meta.confidence,
-						created: meta.created,
-						updated: meta.updated,
-						body,
-					}),
-				);
-				notes += 1;
-			}
-		}
-		return { jsonl: `${lines.join("\n")}\n`, notes };
-	}
-
-	/** Import JSONL produced by `exportJsonl` into the primary (or project) store. */
-	async importJsonl(
-		text: string,
-		options: { mode?: "merge" | "replace" | "skip"; scope?: Scope; dryRun?: boolean } = {},
-	): Promise<{ created: string[]; updated: string[]; skipped: number; errors: string[]; hotImported: boolean }> {
-		const mode = options.mode ?? "merge";
-		const root = this.rootForScope(options.scope ?? "primary");
-		await ensureStore(root, this.config.hotLimit, this.config.defaultCategory);
-		const state = await this.storeFor(root);
-		const records = decodeJsonl(text);
-		const result = { created: [] as string[], updated: [] as string[], skipped: 0, errors: records.errors, hotImported: false };
-		return this.locks.run(root, async () => {
-			let changed = false;
-			let completed = false;
-			try {
-				for (const record of records.records) {
-					if (record.type === "hot") {
-						if (options.dryRun) continue;
-						// Already inside the root lock: call the store helpers directly.
-						await writeHot(root, record.content);
-						result.hotImported = true;
-						continue;
-					}
-					if (!options.dryRun) changed = true;
-					const outcome = await this.importNote(root, state, record, mode, options.dryRun === true);
-					if (!options.dryRun && outcome !== "skipped") changed = true;
-					if (outcome === "created") result.created.push(record.id);
-					else if (outcome === "updated") result.updated.push(record.id);
-					else result.skipped += 1;
-				}
-				completed = true;
-				return result;
-			} finally {
-				if (changed) {
-					this.bumpCacheGeneration();
-					if (!completed) state.index.dirty = true;
-					state.index.builtAt = Date.now();
-					state.saver.schedule();
-				}
-			}
-		});
-	}
-
-	private async importNote(
-		root: string,
-		state: StoreState,
-		note: ImportedNote,
-		mode: "merge" | "replace" | "skip",
-		dryRun: boolean,
-	): Promise<"created" | "updated" | "skipped"> {
-		const existingIdx = state.index.idxForId(note.id);
-		const existing = existingIdx !== undefined ? await resolveMemoryRef(root, note.id, liveLookup(state.index)) : undefined;
-		if (existing) {
-			if (mode === "skip") return "skipped";
-			if (dryRun) return "updated";
-			if (mode === "replace") {
-				const updated = await updateMemory(root, existing, {
-					title: note.title,
-					content: note.body,
-					tags: note.tags,
-					aliases: note.aliases,
-					related: note.related,
-					supersedes: note.supersedes,
-					summary: note.summary,
-					priority: note.priority,
-					confidence: note.confidence,
-					category: note.category || existing.category,
-				});
-				state.index.removeDoc(existingIdx!);
-				state.index.addDoc(updated);
-				return "updated";
-			}
-			// merge: fold in the fact units that are not already present.
-			let body = existing.body;
-			let changed = false;
-			for (const unit of extractFactUnits(note.body)) {
-				const appended = appendFact(body, unit.label, unit.text);
-				if (appended.changed) {
-					body = appended.body;
-					changed = true;
-				}
-			}
-			const newTags = note.tags.filter((tag) => !existing.tags.includes(tag));
-			const newAliases = note.aliases.filter((alias) => !existing.aliases.some((current) => current.toLowerCase() === alias.toLowerCase()));
-			const tags = newTags.length > 0 ? [...new Set([...existing.tags, ...newTags])] : undefined;
-			const aliases = newAliases.length > 0 ? [...new Set([...existing.aliases, ...newAliases])] : undefined;
-			if (!changed && !tags && !aliases) return "skipped";
-			const updated = await updateMemory(root, existing, {
-				content: changed ? body : undefined,
-				tags,
-				aliases,
-				summary: changed ? extendSummary(existing.summary, note.summary) : undefined,
-			});
-			state.index.removeDoc(existingIdx!);
-			state.index.addDoc(updated);
-			return "updated";
-		}
-		if (dryRun) return "created";
-		// `writeImportedNote` avoids the path when it is taken by a different note,
-		// so an import can never overwrite an existing memory.
-		const written = await writeImportedNote(root, note);
-		const stale = state.index.idxForRelPath(written.relPath);
-		if (stale >= 0) state.index.removeDoc(stale);
-		const staleId = state.index.idxForId(written.id);
-		if (staleId !== undefined && staleId !== stale) state.index.removeDoc(staleId);
-		state.index.addDoc(written);
-		return "created";
 	}
 
 	/**

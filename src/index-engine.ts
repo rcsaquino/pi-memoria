@@ -42,6 +42,7 @@ export function isIgnoredWatchPath(relName: string): boolean {
 	const name = normalizeRelPath(relName);
 	if (!name) return true;
 	if (name === INDEX_DIR || name.startsWith(`${INDEX_DIR}/`)) return true;
+	if (name === ".history" || name.startsWith(".history/")) return true;
 	if (name === TRASH_DIR || name.startsWith(`${TRASH_DIR}/`)) return true;
 	if (basename(name) === GENERATED_INDEX) return true;
 	return false;
@@ -1012,7 +1013,7 @@ export class MemoryIndex {
 			if (recent.length < recentLimit) {
 				recent.push({ id: meta.id, title: meta.title, relPath: meta.relPath, created: meta.created });
 				recent.sort((a, b) => b.created - a.created);
-			} else if (meta.created > recent[recent.length - 1].created) {
+			} else if (recentLimit > 0 && meta.created > recent[recent.length - 1].created) {
 				recent[recent.length - 1] = { id: meta.id, title: meta.title, relPath: meta.relPath, created: meta.created };
 				recent.sort((a, b) => b.created - a.created);
 			}
