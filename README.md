@@ -22,7 +22,7 @@ No configuration is required.
 Alternatively, install a tagged release from GitHub:
 
 ```sh
-pi install git:github.com/rcsaquino/pi-memoria@v0.1.3
+pi install git:github.com/rcsaquino/pi-memoria@v0.2.0
 ```
 
 Use one installation method, not both.
